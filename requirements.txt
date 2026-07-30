@@ -1,0 +1,19 @@
+# Minimal deps for the wrapper. ComfyUI's own requirements.txt already
+# provides torch / torchvision / transformers / einops / safetensors /
+# sentencepiece / numpy / scipy / Pillow / tqdm / requests / kornia /
+# tokenizers — we don't list any of those to avoid pip renegotiating
+# their versions and breaking other nodes.
+#
+# huggingface_hub<1.0 is mandatory: transformers (in ComfyUI) refuses
+# hf_hub 1.x. Same lesson as the DKT wrapper.
+
+huggingface_hub<1.0
+imageio
+ftfy
+accelerate
+loguru
+modelscope
+opencv-python
+matplotlib
+peft
+diffsynth-engine

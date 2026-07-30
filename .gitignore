@@ -1,0 +1,23 @@
+# Vendored upstream — auto-cloned on first node use, not committed.
+UniVidX/
+
+# Local model cache (lives under ComfyUI/models/unividx/ anyway, but if
+# anyone symlinks it here, don't track the weights).
+models/
+*.pt
+*.safetensors
+*.bin
+
+# Node help markdown — generated from modes.py at import so it can't
+# drift out of sync with the modes the nodes actually offer.
+web/docs/
+
+# Python noise
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Editor
+.vscode/
+.idea/

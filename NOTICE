@@ -1,0 +1,61 @@
+ComfyUI-BAT-UniVidXWrapper
+Copyright 2026 BeeeFX
+
+This wrapper is licensed under GNU General Public License v3 — see
+the LICENSE file at the repo root for the full text.
+
+────────────────────────────────────────────────────────────────────────
+Sources derived from / inspired by other GPL v3 projects
+────────────────────────────────────────────────────────────────────────
+
+Portions of this wrapper (specifically the FP8 quantization, distill
+LoRA pre-merge, torch.compile, sage attention and SDPA-restore code
+paths) are derived from the UniVidX_ComfyUI custom-node pack:
+
+  Files: unividx_wrapper_runtime/fp8_loader.py
+         unividx_wrapper_runtime/lora_merge.py
+         and the *_advanced() helpers in unividx_wrapper_runtime/runtime.py
+
+  Origin: UniVidX_ComfyUI by the original wrapper authors, also GPL v3.
+
+The GPL v3 license terms of UniVidX_ComfyUI carry through to those
+files. We acknowledge the original authors' work and re-license this
+combined work under GPL v3 so the chain stays consistent.
+
+────────────────────────────────────────────────────────────────────────
+Runtime dependencies (NOT redistributed by this repo)
+────────────────────────────────────────────────────────────────────────
+
+UniVidX — Unified video intrinsic decomposition + matting
+  https://github.com/houyuanchen111/UniVidX
+  Apache License 2.0
+  Cloned into ./UniVidX/ by the wrapper on first node use; this repo
+  does not vendor or redistribute its source. Upstream-side patches
+  (a missing __init__.py and a soft-import of torchvision.io.write_video)
+  are applied automatically post-clone so the user never has to.
+
+Wan2.1-T2V-14B (Tongyi Wanxiang / Alibaba) — Video diffusion backbone
+  https://github.com/Wan-Video/Wan2.1
+  Apache License 2.0
+  Model weights (~57 GB) downloaded from huggingface.co/Wan-AI/Wan2.1-T2V-14B
+  by the wrapper on first node use. The Wan2.1-VACE-14B and
+  Wan2.1-I2V-14B variants are NOT compatible with UniVidX — the
+  loader rejects them.
+
+DiffSynth-Engine (modelscope) — VRAM management + Wan VAE plumbing
+  https://github.com/modelscope/DiffSynth-Engine
+  Apache License 2.0
+  Installed via pip; UniVidX depends on it for layer-streaming offload.
+
+UniVidX checkpoint weights (intrinsic + alpha variants)
+  https://huggingface.co/houyuanchen/UniVidX
+  Downloaded from HuggingFace on first node use. ~0.8 GB per variant.
+
+mmgp (modelscope) — Memory-mapped GPU-friendly safetensors loading
+  Installed transitively via DiffSynth-Engine; used by upstream UniVidX
+  for the FP8 weight-load path.
+
+SageAttention (optional)
+  Installed by the user when prefer_sage_attn is enabled on the loader.
+  The wrapper monkey-patches DiffSynth's attention dispatcher to prefer
+  it when present.
