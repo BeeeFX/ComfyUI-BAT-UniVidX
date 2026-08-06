@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any, Optional
 
 import torch
@@ -57,6 +58,11 @@ _WRAPPER_DIR = os.path.dirname(os.path.abspath(__file__))
 # connectable to the V1 Loader and Decode nodes either side of it.
 UniVidXModel = io.Custom("UNIVIDX_MODEL")
 UniVidXResult = io.Custom("UNIVIDX_RESULT")
+# Sample-time option payloads, produced by the two V1 options nodes near
+# the bottom of this file. Plain dicts on the wire — same idea as
+# BAT_CROP_INFO in the NodePack.
+UniVidXContextOptions = io.Custom("UNIVIDX_CONTEXT_OPTIONS")
+UniVidXCacheOptions = io.Custom("UNIVIDX_CACHE_OPTIONS")
 
 
 # ─── BAT UniVidX Loader ─────────────────────────────────────────────────────
@@ -67,9 +73,10 @@ class BatUniVidXLoader:
 
     Defaults aim for "just works" on a fresh ComfyUI install:
     auto-detect existing Wan2.1-T2V-14B weights anywhere under
-    ComfyUI/models/; download if missing; bf16 dtype; 4 GB VRAM
-    buffer for DiffSynth's offload. Power-user knobs are hidden
-    behind `advanced_settings`.
+    ComfyUI/models/; download if missing; bf16 dtype; auto-sized VRAM
+    buffer for DiffSynth's offload; FP8 quantisation and the fastest
+    available attention backend. Every widget is honoured — there is no
+    gate that discards them.
     """
 
     @classmethod
@@ -122,42 +129,51 @@ class BatUniVidXLoader:
                         ),
                     },
                 ),
-                "advanced_settings": (
-                    "BOOLEAN",
-                    {
-                        "default": False,
-                        "tooltip": (
-                            "Expose the perf knobs below. Off = the "
-                            "loader uses safe defaults (bf16, no LoRA, "
-                            "no FP8, no compile, native attention). On "
-                            "= you control fp8 quantization, distill "
-                            "LoRA pre-merge, torch.compile, and the "
-                            "sage attention dispatcher."
-                        ),
-                    },
-                ),
+                # `advanced_settings` (BOOLEAN) used to live here. Removed:
+                # it claimed to "expose the perf knobs below", but ComfyUI
+                # shows optional widgets unconditionally, so it hid nothing
+                # — its only effect was to DISCARD distill_lora,
+                # distill_strength, compile_dit and attention_backend when
+                # off. You could pick a LoRA, tick compile, and get neither,
+                # with no warning. Every widget is now simply honoured.
             },
             "optional": {
                 "vram_buffer_gb": (
                     "FLOAT",
                     {
-                        "default": 4.0, "min": 0.5, "max": 16.0, "step": 0.5,
+                        "default": 0.0, "min": 0.0, "max": 80.0, "step": 0.5,
                         "tooltip": (
-                            "GB of VRAM kept free for activations / KV "
-                            "cache / VAE decode. DiffSynth streams DiT "
-                            "layers CPU↔GPU to honour this. Higher = "
-                            "more free VRAM but slower (more streaming). "
-                            "4.0 is sane for bf16 Wan2.1-14B on a 32 GB "
-                            "card. Drop to 0.5 when you've FP8-quantized "
-                            "and the DiT fully fits."
+                            "GB of VRAM to keep FREE for activations / "
+                            "attention / VAE decode. DiffSynth computes "
+                            "`limit = total_vram - this` and offloads DiT "
+                            "layers to CPU to stay under it. So HIGHER = "
+                            "more headroom for activations (and more "
+                            "CPU↔GPU streaming, so slower); LOWER = more "
+                            "of the model stays resident (faster, until "
+                            "you OOM).\n\n"
+                            "0 = auto (recommended): sized from the card's "
+                            "actual VRAM, the dtype, and whether FP8 is "
+                            "on. The loader logs the value it picked.\n\n"
+                            "Set explicitly only to override auto. Note "
+                            "the reservation must cover the SAMPLER's peak "
+                            "allocation, which for UniVidX is large — it "
+                            "attends over four modality streams at once, "
+                            "so a single step can ask for 20+ GB at 21 "
+                            "frames. Reserving too little OOMs at sample "
+                            "time even when the model itself loaded fine."
                         ),
                     },
                 ),
                 "fp8_quantize": (
-                    ["none", "qfloat8_prequantized"],
-                    {"default": "none",
+                    ["qfloat8_prequantized", "none"],
+                    {"default": "qfloat8_prequantized",
                      "tooltip": (
-                         "FP8 e4m3fn DiT substitution. Halves DiT VRAM "
+                         "FP8 e4m3fn DiT substitution. ON by default: bf16 "
+                         "needs ~32 GB of VRAM for the DiT alone, which "
+                         "doesn't leave room for activations on most cards. "
+                         "Set to 'none' only on a card with headroom to "
+                         "spare.\n\n"
+                         "Halves DiT VRAM "
                          "(~28 GB → ~14 GB) and enables full residency "
                          "on a 32 GB card. Per-tensor absmax scaling, "
                          "runtime-quantized from the bf16 cold-load — "
@@ -170,17 +186,36 @@ class BatUniVidXLoader:
                      )},
                 ),
                 "distill_lora": (
-                    ["none", "lightx2v"],
+                    ["none"] + _list_lora_files(),
                     {"default": "none",
                      "tooltip": (
-                         "Pre-merge a step-distill LoRA into the DiT's "
-                         "base weights. With lightx2v + "
-                         "num_inference_steps=4 + cfg_scale=1.0 you get "
-                         "~5× faster wall-clock at a small quality cost "
-                         "(typically 22-26 dB PSNR vs the 20-step "
-                         "production reference). Requires the LoRA file "
-                         "at models/loras/lightx2v/ (see the loader's "
-                         "error message if missing)."
+                         "Pre-merge a step-distill LoRA into the DiT's base "
+                         "weights, so far fewer sampler steps produce a "
+                         "usable image. Lists everything in "
+                         "ComfyUI/models/loras/.\n\n"
+                         "The filename must say T2V + 14B + Wan2.1 + "
+                         "distill/lightx2v. This backbone is Wan2.1-T2V-14B, "
+                         "so an I2V file is the easy mistake — Wan2.1 I2V "
+                         "and T2V share most of the DiT, so it merges "
+                         "without error and just quietly hurts quality. "
+                         "Skip anything I2V, anything Wan2.2, and any "
+                         "style/likeness LoRA (those do nothing for "
+                         "speed).\n\n"
+                         "Good: Wan21_T2V_14B_lightx2v_cfg_step_distill_"
+                         "lora_rank32.safetensors. Then set "
+                         "num_inference_steps=4 and cfg_scale=1.0 — that is "
+                         "roughly 5x faster than the 20-step default.\n\n"
+                         "This is the biggest speed lever available, and "
+                         "the riskiest. The LoRA merges into the frozen "
+                         "base underneath UniVidX's four per-modality "
+                         "adapters — they do not collide — but those "
+                         "adapters were trained against the ORIGINAL base, "
+                         "so moving it can degrade albedo/normal quality in "
+                         "ways that are obvious only on a side-by-side. "
+                         "Compare before trusting it.\n\n"
+                         "A LoRA for a different base model will merge "
+                         "almost nothing; the log reports how many keys "
+                         "matched, and warns loudly on zero."
                      )},
                 ),
                 "distill_strength": (
@@ -205,18 +240,34 @@ class BatUniVidXLoader:
                          "runs forces a recompile."
                      )},
                 ),
-                "prefer_sage_attn": (
-                    "BOOLEAN",
-                    {"default": False,
+                # NOTE: this replaced a BOOLEAN `prefer_sage_attn` in the
+                # same (last) widget slot, so saved workflows keep every
+                # other widget aligned. Old templates hand a bool in here;
+                # runtime._coerce_attention_backend maps False→auto,
+                # True→sage so they keep executing.
+                "attention_backend": (
+                    ["auto", "sdpa", "flash_attn_2", "sage"],
+                    {"default": "auto",
                      "tooltip": (
-                         "Replace DiffSynth's attention dispatcher with "
-                         "a SageAttention-first wrapper that falls back "
-                         "to FA2 then SDPA. Requires "
-                         "`pip install sageattention` (or the "
-                         "woct0rdho prebuilt wheel). Only kicks in on "
-                         "attention calls with head_dim ∈ {64, 96, "
-                         "128} — UniVidX's CMSA path stays on native "
-                         "SDPA for correctness."
+                         "Which attention kernel the DiT uses.\n\n"
+                         "Expect a few percent, not a multiple. UniVidX "
+                         "hardcodes SDPA, but torch's SDPA is ALREADY a "
+                         "fused FlashAttention kernel — forcing the naive "
+                         "math path on the same shape is 13× slower, so "
+                         "there is no big win sitting here. Measured on "
+                         "sm_86 at Wan2.1-14B geometry: SDPA 14.4 ms, "
+                         "FA2 13.9 ms, Sage 16.7 ms.\n\n"
+                         "auto (recommended): FlashAttention-2 if "
+                         "importable, else SDPA.\n"
+                         "sdpa: stock PyTorch — the pre-existing behaviour.\n"
+                         "flash_attn_2: force FA2.\n"
+                         "sage: force SageAttention (int8; measured SLOWER "
+                         "and less exact on sm_86, and this env has no sm90 "
+                         "kernel — but the farm card may differ, so it's "
+                         "here to be measured).\n\n"
+                         "All backends agree with SDPA to <2% on the "
+                         "cross-modality attention. A VISIBLE difference is "
+                         "a bug, not a tradeoff. Resolved backend is logged."
                      )},
                 ),
             },
@@ -232,13 +283,17 @@ class BatUniVidXLoader:
         variant: str,
         dtype: str,
         wan21_source: str,
-        advanced_settings: bool,
-        vram_buffer_gb: float = 4.0,
-        fp8_quantize: str = "none",
+        # Accepted but ignored: the widget is gone (see INPUT_TYPES), and
+        # this keeps a stale caller from raising TypeError.
+        advanced_settings: bool = False,
+        vram_buffer_gb: float = 0.0,  # 0 = auto (see resolve below)
+        fp8_quantize: str = "qfloat8_prequantized",
         distill_lora: str = "none",
         distill_strength: float = 1.0,
         compile_dit: bool = False,
-        prefer_sage_attn: bool = False,
+        # Was a BOOLEAN `prefer_sage_attn`; old saved workflows still send
+        # one. runtime._coerce_attention_backend handles the bool form.
+        attention_backend="auto",
     ):
         # Stage 1: ensure upstream UniVidX is cloned + patched.
         upstream_dir = auto_clone.auto_clone(_WRAPPER_DIR)
@@ -269,28 +324,89 @@ class BatUniVidXLoader:
 
         # Stage 4: load (or fetch from cache).
         torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
-        advanced = None
-        if advanced_settings:
-            advanced = {
-                "fp8_quantize": fp8_quantize,
-                "distill_lora": distill_lora,
-                "distill_strength": float(distill_strength),
-                "compile_dit": compile_dit,
-                "prefer_sage_attn": prefer_sage_attn,
-            }
+        # Every widget is honoured. FP8 defaults ON at the widget itself
+        # (a bf16 Wan2.1-14B DiT is ~28-32 GB and leaves no room for
+        # activations), so "I changed nothing" still gets a configuration
+        # that fits in VRAM — without a gate that throws away the settings
+        # of anyone who did change something.
+        advanced = {
+            "fp8_quantize": fp8_quantize,
+            "distill_lora": distill_lora,
+            "distill_strength": float(distill_strength),
+            "compile_dit": compile_dit,
+            "attention_backend": attention_backend,
+        }
+
+        # vram_buffer_gb == 0 means "auto": size the activation reservation
+        # from the card's real VRAM and whether the DiT will be FP8. A
+        # fixed default can't work here — the same number that's right on
+        # a 32 GB card starves the sampler on a 96 GB one (see
+        # runtime.auto_vram_buffer_gb).
+        resolved_vram_buffer = float(vram_buffer_gb)
+        if resolved_vram_buffer <= 0.0:
+            resolved_vram_buffer = runtime.auto_vram_buffer_gb(
+                fp8=advanced.get("fp8_quantize", "none") != "none",
+            )
+            total = runtime.total_vram_gb()
+            logger.info(
+                "UniVidX: vram_buffer_gb=auto -> %.1f GB reserved for "
+                "activations (card total: %s)",
+                resolved_vram_buffer,
+                f"{total:.1f} GB" if total is not None else "CPU-only",
+            )
         model = runtime.load_model(
             variant=variant,
             upstream_dir=upstream_dir,
             wan21_path=wan21_path,
             ckpt_path=ckpt_path,
             dtype=torch_dtype,
-            vram_buffer_gb=float(vram_buffer_gb),
+            vram_buffer_gb=resolved_vram_buffer,
             advanced=advanced,
         )
         # UNIVIDX_MODEL is an opaque tuple (model, variant, upstream_dir).
         # The sampler needs all three: model to call, variant for family
         # checks, upstream_dir for the chdir guard.
         return ((model, variant, upstream_dir),)
+
+
+# Filename fragments that suggest a LoRA is a step-distill for this
+# backbone. Used only to ORDER the dropdown, never to filter it.
+_DISTILL_HINTS = ("distill", "lightx2v", "causvid", "accvid", "turbo")
+_WAN_HINTS = ("wan21", "wan2.1", "wan2_1", "wan_2", "t2v")
+
+
+def _list_lora_files() -> list[str]:
+    """Everything under models/loras/, most-likely-relevant first.
+
+    Populates the `distill_lora` dropdown. Nothing is filtered out — any
+    Wan2.1-T2V-14B step-distill LoRA works, new ones keep appearing, and
+    hiding a file someone just downloaded would be worse than a long list.
+    But a flat alphabetical listing buries the five Wan LoRAs under 80
+    FLUX ones, so sort into three tiers: step-distill candidates, other
+    Wan LoRAs, then everything else. Each tier alphabetical.
+
+    Picking an incompatible LoRA is not silent: the merge reports how many
+    keys matched and warns loudly on zero.
+
+    Not cached — folder_paths already caches the directory listing, so
+    going through it means a LoRA added while the server is running shows
+    up on the next graph refresh.
+    """
+    try:
+        names = list(folder_paths.get_filename_list("loras"))
+    except Exception as exc:  # no loras dir configured, etc.
+        logger.debug("UniVidX: could not list loras (%s)", exc)
+        return []
+
+    def tier(name: str) -> int:
+        low = name.lower()
+        if any(h in low for h in _DISTILL_HINTS):
+            return 0
+        if any(h in low for h in _WAN_HINTS):
+            return 1
+        return 2
+
+    return sorted(names, key=lambda n: (tier(n), n.lower()))
 
 
 _WAN_PATH_CACHE: Optional[list[str]] = None
@@ -601,6 +717,21 @@ class BatUniVidXSample(io.ComfyNode):
                             "resolutions; leave on unless you're sure "
                             "you don't need it.",
                 ),
+                UniVidXContextOptions.Input(
+                    "context_options", optional=True,
+                    tooltip="Wire a 🦇 UniVidX Context Options node to "
+                            "control temporal windowing for clips longer "
+                            "than one pass. Leave unwired for the "
+                            "defaults (81-frame windows, 16 overlap), "
+                            "which switch on automatically past 81 frames.",
+                ),
+                UniVidXCacheOptions.Input(
+                    "cache_options", optional=True,
+                    tooltip="Wire a 🦇 UniVidX Cache Options node to enable "
+                            "TeaCache step skipping (faster, slightly less "
+                            "faithful). Unwired = no caching, i.e. today's "
+                            "exact numerics.",
+                ),
             ],
             outputs=[
                 UniVidXResult.Output(
@@ -678,6 +809,8 @@ class BatUniVidXSample(io.ComfyNode):
         num_inference_steps: int,
         seed: int,
         tiled: bool = True,
+        context_options: Optional[dict] = None,
+        cache_options: Optional[dict] = None,
     ) -> io.NodeOutput:
         model_instance, variant, upstream_dir = model
 
@@ -793,8 +926,67 @@ class BatUniVidXSample(io.ComfyNode):
             "tile_stride": _UPSTREAM_TILE_STRIDE,
             "is_inference": True,
             "training_mode": mode_name,
+            # Upstream defaults these to True in model_fn_wan_video
+            # (univid_intrinsic.py:1213) because that signature is shared
+            # with the trainer. At inference, inside torch.inference_mode(),
+            # there is no backward pass for checkpointing to save memory
+            # for — it is pure wrapper overhead over all 40 blocks.
+            "use_gradient_checkpointing": False,
+            "use_gradient_checkpointing_offload": False,
             **inference_videos,
         }
+
+        # ── Temporal context windowing ──────────────────────────────────
+        # Upstream's TemporalTiler_BCTHW slices only the temporal axis and
+        # its blend mask broadcasts over the batch, so all four modality
+        # streams are windowed together — which is required, since
+        # self-attention folds them into one sequence. `pipe()` forwards
+        # unconsumed kwargs straight to model_fn, so these two keys are
+        # all it takes to switch it on.
+        window = _resolve_context_window(target_frames, context_options)
+        if window is not None:
+            size, stride = window
+            pipe_args["sliding_window_size"] = size
+            pipe_args["sliding_window_stride"] = stride
+            # Report in PIXEL frames — the unit the user set. `size` and
+            # `stride` are latent frames because that's the axis the tiler
+            # slices, and quoting those alongside a pixel-frame total
+            # reads as a 4x smaller window than it is.
+            win_px = (size - 1) * 4 + 1
+            n_windows = _count_context_windows(target_frames, size, stride)
+            logger.info(
+                "UniVidX_Sample: context windowing ON — %d frames in "
+                "%d windows of %d frames (overlap %d). %s Peak VRAM is set "
+                "by the WINDOW, not the clip: %d frames costs the same per "
+                "pass as an unwindowed %d-frame render.",
+                target_frames, n_windows, win_px,
+                (size - stride) * 4,
+                "Explicit context_options." if context_options
+                else "Auto-enabled: clip is longer than one pass.",
+                win_px, win_px,
+            )
+
+        # ── TeaCache ────────────────────────────────────────────────────
+        want_cache, cache_refusal = _resolve_cache_plan(
+            cache_options, windowing=window is not None, cfg_scale=cfg_scale,
+            num_inference_steps=int(num_inference_steps),
+        )
+        if cache_refusal:
+            logger.warning("UniVidX_Sample: %s", cache_refusal)
+        if want_cache:
+            tea = runtime.build_tea_cache_for_run(
+                model_instance,
+                num_inference_steps=int(num_inference_steps),
+                rel_l1_thresh=float(cache_options["rel_l1_thresh"]),
+            )
+            if tea is not None:
+                pipe_args["tea_cache"] = tea
+                logger.info(
+                    "UniVidX_Sample: TeaCache ON (rel_l1_thresh=%.3f). "
+                    "Steps where the timestep embedding barely moves "
+                    "will reuse the cached residual.",
+                    float(cache_options["rel_l1_thresh"]),
+                )
 
         logger.info(
             "UniVidX_Sample: mode=%s, frames=%d @ %dx%d, steps=%d, "
@@ -804,11 +996,36 @@ class BatUniVidXSample(io.ComfyNode):
             "" if cfg_scale != _CFG_DISABLED else " (guidance off)",
         )
 
+        # Give the conditioning VAE encode the tiling the sampler's own
+        # `tiled` widget asks for — upstream's inference branch omits it,
+        # so it silently runs full-frame — and time it. Everything between
+        # "sampling started" and the first progress tick happens inside
+        # pipe(): conditioning encode, prompt encode, and three model
+        # swaps. That stretch was ~9 minutes on a real 81-frame job with
+        # nothing logged, so it is worth measuring rather than guessing.
+        runtime.instrument_vae_encode(
+            model_instance, tiled=bool(tiled),
+            tile_size=_UPSTREAM_TILE_SIZE, tile_stride=_UPSTREAM_TILE_STRIDE,
+        )
+
         pbar.update_absolute(1, 3)
+        _t_pipe = time.perf_counter()
         with runtime.unividx_cwd(upstream_dir):
             with torch.inference_mode():
                 result_dict = model_instance.pipe(**pipe_args)
+        logger.info(
+            "UniVidX_Sample: pipe() total %.1f s (conditioning encode + "
+            "prompt encode + model swaps + %d sampler steps + VAE decode).",
+            time.perf_counter() - _t_pipe, int(num_inference_steps),
+        )
         pbar.update_absolute(2, 3)
+
+        # Report what caching actually saved. The threshold -> skip-count
+        # mapping is clip-dependent, so the measured number is worth more
+        # than any figure the docs could quote.
+        report = runtime.tea_cache_report(pipe_args.get("tea_cache"))
+        if report:
+            logger.info("UniVidX_Sample: %s", report)
 
         # Wrap with the metadata the decoder needs to splay correctly.
         result = {
@@ -995,6 +1212,259 @@ _register_mode_reference_route()
 help_docs.write_help_docs(os.path.join(_WRAPPER_DIR, "web"))
 
 
+# ─── Context-window planning ────────────────────────────────────────────────
+
+# Defaults used when no Context Options node is wired. 81 frames is both
+# Wan 2.1's native training length and the largest single pass verified to
+# run here; 16 frames of overlap matches the value Kijai's WanVideoWrapper
+# ships for the same backbone.
+_DEFAULT_CONTEXT_FRAMES = 81
+_DEFAULT_CONTEXT_OVERLAP = 16
+
+
+def _pixel_to_latent_frames(n: int) -> int:
+    """Wan's temporal VAE maps N pixel frames to (N-1)//4 + 1 latents."""
+    return (int(n) - 1) // 4 + 1
+
+
+def _resolve_context_window(target_frames: int, context_options):
+    """Plan temporal windowing, or None to sample in a single pass.
+
+    Returns `(size, stride)` in LATENT frames — not pixel frames.
+    TemporalTiler_BCTHW slices dim 2 of the latents tensor, which is the
+    latent temporal axis, so feeding it pixel counts would window roughly
+    4x too long and quietly do nothing on clips under ~324 frames.
+
+    Windowing engages only when the clip genuinely exceeds one window, so
+    an unwired node never changes behaviour for existing short jobs.
+    """
+    opts = context_options or {}
+    frames = int(opts.get("context_frames", _DEFAULT_CONTEXT_FRAMES))
+    overlap = int(opts.get("context_overlap", _DEFAULT_CONTEXT_OVERLAP))
+
+    total_lat = _pixel_to_latent_frames(target_frames)
+    size_lat = _pixel_to_latent_frames(frames)
+    if size_lat >= total_lat:
+        return None  # fits in one pass; nothing to window
+
+    # Overlap is a length, not an index, so it scales by the plain factor.
+    overlap_lat = max(1, overlap // 4)
+    # stride < size is mandatory: the tiler derives its blend ramp width as
+    # (size - stride), and a width of 0 makes build_1d_mask slice `x[-0:]`
+    # — the whole tensor — against an empty right-hand side and raise.
+    overlap_lat = min(overlap_lat, size_lat - 1)
+    stride_lat = size_lat - overlap_lat
+    return size_lat, stride_lat
+
+
+def _count_context_windows(target_frames: int, size_lat: int,
+                           stride_lat: int) -> int:
+    """How many passes the tiler will actually make.
+
+    Mirrors TemporalTiler_BCTHW.run's loop exactly (util.py:967-969),
+    including its skip of a window the previous one already covered,
+    rather than estimating with a ceiling division — an estimate here
+    once reported 9 windows for a job that ran 2.
+    """
+    total_lat = _pixel_to_latent_frames(target_frames)
+    n = 0
+    for t in range(0, total_lat, stride_lat):
+        if t - stride_lat >= 0 and t - stride_lat + size_lat >= total_lat:
+            continue
+        n += 1
+    return n
+
+
+def _resolve_cache_plan(cache_options, *, windowing: bool, cfg_scale: float,
+                        num_inference_steps: int):
+    """Decide whether TeaCache may run. Returns `(enabled, refusal_message)`.
+
+    Pulled out of `execute` so the interlocks are testable — both of the
+    conditions below were found the hard way, in production, after a
+    multi-minute model load.
+
+    Refusals:
+
+    * **Context windowing.** TeaCache keeps ONE residual and ONE step
+      counter, but `model_fn` runs once per window per step. `self.step`
+      then counts windows rather than denoising steps and wraps against
+      `num_inference_steps`, so the cache gets reused across different
+      parts of the clip. Separately, the stored residual carries one
+      window's shape and the tiler's final window is usually shorter, so
+      `update()` raises a size mismatch. The shape error is the lucky
+      case; the step-counter corruption is silent. Per-window caches
+      would fix both but multiply TeaCache's already-large residual by
+      the window count — backwards, since windowing exists to save
+      memory.
+
+    * **CFG on.** With `cfg_scale != 1` the DiT runs twice per step
+      (positive and negative), and one shared cache would double-advance
+      its counter and blend the two passes' residuals.
+
+    A low step count is only a warning, not a refusal: caching still
+    works, it just cannot pay for itself. TeaCache always computes the
+    first and last step, so at N steps there are only N-2 candidates —
+    at 4 steps you risk several GB of residuals to skip at most 2 passes.
+    """
+    if not cache_options:
+        return False, None
+    if float(cache_options.get("rel_l1_thresh", 0.0)) <= 0:
+        return False, None
+
+    if windowing:
+        return False, (
+            "cache_options ignored — TeaCache and context windowing cannot "
+            "be combined. TeaCache keeps one residual and one step counter, "
+            "but the model runs once per window per step, so the cache "
+            "would be reused across different parts of the clip (and its "
+            "shape breaks on the shorter final window). Either raise "
+            "context_frames so the clip fits a single pass, or remove the "
+            "Cache Options node."
+        )
+
+    if cfg_scale != _CFG_DISABLED:
+        return False, (
+            f"cache_options ignored — TeaCache needs cfg_scale="
+            f"{_CFG_DISABLED:.1f} (guidance off) so the DiT runs once per "
+            f"step, but cfg_scale is {cfg_scale:.1f}. Clear the prompt or "
+            f"set cfg_scale={_CFG_DISABLED:.1f} to use caching."
+        )
+
+    if num_inference_steps <= _TEACACHE_MIN_USEFUL_STEPS:
+        # Enabled, but say plainly that it is a bad trade here.
+        return True, (
+            f"TeaCache at only {num_inference_steps} steps is probably not "
+            f"worth it — the first and last step always compute, so at most "
+            f"{max(0, num_inference_steps - 2)} can be skipped, while the "
+            f"cached residuals cost several GB of VRAM for the whole run. "
+            f"It is a 20-step optimisation; if you are already on a "
+            f"step-distill LoRA you have bought that speedup already."
+        )
+
+    return True, None
+
+
+# Below this, TeaCache can skip at most num_inference_steps-2 passes,
+# which rarely justifies holding two hidden-state tensors on the GPU.
+_TEACACHE_MIN_USEFUL_STEPS = 8
+
+
+# ─── Sample-time options nodes ──────────────────────────────────────────────
+# Both are plain V1 nodes emitting a dict over a custom wire type, wired
+# into optional sockets on the Sample node. Two separate nodes rather than
+# one combined "options" node: windowing and caching are unrelated, and
+# each changes output pixels, so wiring one should be a deliberate act.
+#
+# Optional SOCKETS rather than new widgets is also what keeps saved
+# workflows intact — ComfyUI stores widget values as a positional array,
+# so adding widgets to an existing node shifts it, while an unwired
+# optional input is simply never passed.
+
+
+class BatUniVidXCacheOptions:
+    """TeaCache settings for the Sample node."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "rel_l1_thresh": (
+                    "FLOAT",
+                    {"default": 0.08, "min": 0.0, "max": 1.0, "step": 0.01,
+                     "tooltip": (
+                         "How much the timestep embedding may drift before "
+                         "the DiT is recomputed. Higher = more steps "
+                         "skipped = faster = less faithful. 0 disables.\n\n"
+                         "Start LOW here. The polynomial that rescales the "
+                         "drift was fitted on stock Wan2.1, and in "
+                         "conditioned modes (R2AIN etc.) some rows of the "
+                         "timestep embedding are pinned to a constant — "
+                         "which dilutes the measured drift and makes this "
+                         "threshold skip more eagerly than the same number "
+                         "would on plain Wan2.1."
+                     )},
+                ),
+            }
+        }
+    # No start_step / end_step here on purpose. Kijai's WanVideoWrapper
+    # exposes them, but that's his own TeaCache reimplementation — the one
+    # vendored with UniVidX (util.py:889) takes only
+    # (num_inference_steps, rel_l1_thresh, model_id). It always computes
+    # the first and last step and decides every other step from the
+    # accumulated threshold alone. Exposing a step range here would be two
+    # widgets that quietly do nothing.
+
+    RETURN_TYPES = ("UNIVIDX_CACHE_OPTIONS",)
+    RETURN_NAMES = ("cache_options",)
+    FUNCTION = "build"
+    CATEGORY = "🦇 BAT/UniVidX"
+    DESCRIPTION = (
+        "TeaCache for UniVidX: skip the DiT forward on steps where little "
+        "changes and reuse the previous residual. Typically 1.4-1.9x, at "
+        "some fidelity cost. Wire into the Sample node's cache_options."
+    )
+
+    def build(self, rel_l1_thresh):
+        return ({"rel_l1_thresh": float(rel_l1_thresh)},)
+
+
+class BatUniVidXContextOptions:
+    """Temporal context-window settings for the Sample node."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "context_frames": (
+                    "INT",
+                    {"default": 81, "min": 5, "max": 1000, "step": 4,
+                     "tooltip": (
+                         "Window length in PIXEL frames. 81 is both Wan "
+                         "2.1's native training length and the largest "
+                         "single pass verified to work here, so it is a "
+                         "sensible ceiling rather than an arbitrary one.\n\n"
+                         "Note the latent axis is 4x compressed, so this "
+                         "gets converted to (n-1)/4+1 latent frames "
+                         "internally."
+                     )},
+                ),
+                "context_overlap": (
+                    "INT",
+                    {"default": 16, "min": 4, "max": 200, "step": 4,
+                     "tooltip": (
+                         "Pixel frames shared between neighbouring windows, "
+                         "cross-faded to hide the seam. More overlap = "
+                         "smoother joins but more windows, so more time. "
+                         "Must be smaller than context_frames."
+                     )},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("UNIVIDX_CONTEXT_OPTIONS",)
+    RETURN_NAMES = ("context_options",)
+    FUNCTION = "build"
+    CATEGORY = "🦇 BAT/UniVidX"
+    DESCRIPTION = (
+        "Sample long clips in overlapping temporal windows, blended inside "
+        "the denoising loop, to get past the ~81-frame single-pass limit. "
+        "Windowing switches on automatically above the window length even "
+        "without this node; wire it to override the defaults."
+    )
+
+    def build(self, context_frames, context_overlap):
+        if context_overlap >= context_frames:
+            raise ValueError(
+                f"context_overlap ({context_overlap}) must be smaller than "
+                f"context_frames ({context_frames}) — equal or larger "
+                "leaves no forward progress between windows."
+            )
+        return ({
+            "context_frames": int(context_frames),
+            "context_overlap": int(context_overlap),
+        },)
+
+
 # ─── Registration ───────────────────────────────────────────────────────────
 
 
@@ -1019,12 +1489,16 @@ NODE_CLASS_MAPPINGS = {
     "BAT_UniVidXLoader": BatUniVidXLoader,
     "BAT_UniVidXSample": BatUniVidXSample,
     "BAT_UniVidXDecode": BatUniVidXDecode,
+    "BAT_UniVidXContextOptions": BatUniVidXContextOptions,
+    "BAT_UniVidXCacheOptions": BatUniVidXCacheOptions,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BAT_UniVidXLoader": "🦇 (Down)load UniVidX Model",
     "BAT_UniVidXSample": "🦇 UniVidX Sample",
     "BAT_UniVidXDecode": "🦇 UniVidX Decode",
+    "BAT_UniVidXContextOptions": "🦇 UniVidX Context Options",
+    "BAT_UniVidXCacheOptions": "🦇 UniVidX Cache Options",
 }
 
 # Resolve the V3 schemas once at import so a malformed schema surfaces

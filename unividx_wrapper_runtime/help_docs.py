@@ -165,10 +165,413 @@ downstream wiring survives switching modes.
 """
 
 
+def loader_help_markdown() -> str:
+    """Help page for the Loader — the speed/quality knobs live here."""
+    return """# 🦇 (Down)load UniVidX Model
+
+Loads the Wan2.1-T2V-14B backbone plus the UniVidX adapters, downloading
+whatever is missing, and hands a model to 🦇 UniVidX Sample.
+
+Every widget on this node is honoured — there is no "advanced" gate. (One
+used to exist; it hid nothing and silently discarded the settings below
+it, so it was removed.)
+
+## The basics
+
+### `variant` — which model, and it must match your mode
+
+| Variant | Produces | Use with modes |
+|---|---|---|
+| `intrinsic` | albedo, irradiance, normals | `R2AIN`, `t2RAIN`, `A2RIN`, … |
+| `alpha` | matte, foreground, background | `R2PFB`, `t2RPFB`, `RP2FB`, … |
+
+These are two separately-trained checkpoints, not two settings of one
+model. Mismatching this against the Sample node's mode is caught at
+sampling time with an error naming both sides — it will not silently
+produce nonsense.
+
+### `dtype` — leave on `bf16`
+
+Compute precision for the pipeline. `bf16` is what UniVidX was trained and
+released in. `fp16` exists for hardware without bf16 support and is not
+recommended here: this model's value range was never checked against
+fp16's smaller exponent, so overflow is a real risk.
+
+Note this is separate from `fp8_quantize`, which changes how weights are
+*stored*, not how maths is done.
+
+### `wan21_source` — where the 57 GB backbone comes from
+
+`auto-detect, fall back to download` scans `ComfyUI/models/` (under
+`unividx/`, `diffusion_models/`, `checkpoints/`, `unet/`, `wan/`,
+`Wan2.1/`) for an existing copy and reuses it, downloading from HuggingFace
+into `models/unividx/` only if nothing is found. The other dropdown entries
+are the copies it actually found on disk — pick one to force a specific
+install when you have several.
+
+**Wan2.1-VACE-14B and Wan2.1-I2V-14B will not work.** Different
+fine-tunes; the loader rejects them rather than failing obscurely later.
+
+The UniVidX checkpoint itself (~770 MB per variant) is fetched the same
+way, with no widget — there is only one right file per variant.
+
+### `vram_buffer_gb` — read this when you get an out-of-memory error
+
+**This is the knob that fixes OOM**, and it works the opposite way round
+to how it reads.
+
+It is how much VRAM to keep **FREE for activations** — not how much to
+use. DiffSynth computes `limit = total_vram - this` and offloads DiT
+layers to CPU to stay under that limit. So:
+
+- **Higher** = more offloading = more room for the sampler = slower
+- **Lower** = more of the model stays resident = faster, until you OOM
+
+`0` means auto, which sizes it from the card's actual VRAM and whether FP8
+is on. The chosen value is logged at load:
+
+```
+UniVidX: vram_buffer_gb=auto -> 39.2 GB reserved for activations
+         (card total: 95.0 GB)
+```
+
+Only override if auto guesses wrong. **If you OOM during sampling, raise
+it** — the failure means the model fitted but the sampler's peak
+allocation did not.
+
+Two things make that peak unusually large here. UniVidX attends over all
+four modality streams as a single sequence, so one step can request 20+ GB
+at 81 frames. And FP8-quantised layers **cannot be offloaded at all** —
+quantisation replaces the wrappers that do the streaming — so on an FP8
+run this reservation is the only protection the sampler has.
+
+A worked example: a 95 GB card at the old fixed default of 4.0 GB left a
+91 GB limit, so ~48 GB of DiT stayed resident and a 24 GB allocation died
+with 20 MiB free. Auto now reserves ~39 GB on that card.
+
+## What's on by default
+
+Three things are **on by default**, and none of them changes output
+pixels:
+
+| Setting | Default | Why |
+|---|---|---|
+| `fp8_quantize` | `qfloat8_prequantized` | Halves DiT VRAM (~28 → ~14 GB). Without it a bf16 DiT does not leave room for activations. |
+| `attention_backend` | `auto` | FlashAttention-2 if importable, else SDPA. |
+| `vram_buffer_gb` | `0` = auto | Sized from the card's real VRAM. |
+
+Everything else is off. That is deliberate — nothing that alters your
+albedo/normal output is enabled without you asking — but it does mean
+there is speed left on the table.
+
+## Pushing further (in the order worth trying)
+
+### 1. `distill_lora` — the big one, ~5x
+
+Merges a step-distillation LoRA into the base weights so 4 steps look like
+20. Pick one from the dropdown, then on the Sample node set
+`num_inference_steps=4` and `cfg_scale=1.0`. Leaving steps at 20 wastes
+the entire point.
+
+#### Which file am I looking for?
+
+UniVidX's backbone is **Wan 2.1, T2V, 14B**. All three have to match, and
+the dropdown lists every LoRA you own — most of which are for other
+models. Read the filename:
+
+| Must contain | Because |
+|---|---|
+| `T2V` | This backbone is text-to-video. An `I2V` file is the easy mistake — see below. |
+| `14B` | Not 1.3B, not 5B. |
+| `Wan21` / `Wan2.1` | Not Wan 2.2, which is a different generation. |
+| `distill` or `lightx2v` | It has to be a *step*-distillation LoRA. A style or likeness LoRA does nothing for speed. |
+
+So `Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors`
+qualifies, and `lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16`
+qualifies (v2, higher rank).
+
+Rejected by the same rules: anything with `I2V`, anything under a `WAN22`
+folder, anything `480p`-specific from the I2V line.
+
+**Why `I2V` matters more than it looks.** Wan 2.1's I2V and T2V models
+share most of their DiT, so an I2V LoRA merges *successfully* — plenty of
+keys match, no error — and then degrades your albedo and normals for
+reasons that are impossible to guess from the output. The loader now warns
+on filenames that look I2V or Wan 2.2, but that check is only a substring
+match, so read the name yourself.
+
+Whatever you pick, the log reports how many keys actually merged. A low or
+zero count means wrong base model.
+
+If you have two valid candidates, try the **rank32 v1** first: a
+lower-rank LoRA perturbs the base less, which matters here because
+UniVidX's own adapters were trained against the unmodified base. Then try
+v2 rank64 and compare.
+
+**The risk is real.** The LoRA merges into the frozen base *underneath*
+UniVidX's four per-modality adapters, so there is no key collision — but
+those adapters were trained against the *original* base. Moving it puts
+them off-distribution, and this specific model also pins conditioned rows
+to a fixed timestep, which a 4-step schedule may not suit. Nobody has
+published a UniVidX-specific distill LoRA, so this combination is
+unvalidated. Render the same clip both ways and compare albedo and normals
+before trusting it. `distill_strength` below 1.0 blends toward the
+original base if full merge is too destructive.
+
+### 2. TeaCache — ~1.4-1.9x
+
+Not here; wire a **🦇 UniVidX Cache Options** node into the Sample node.
+Skips the DiT entirely on steps where the timestep embedding has barely
+moved, reusing the previous residual.
+
+`rel_l1_thresh` is the only knob: higher = more steps skipped = faster and
+less faithful. **Start low (~0.05-0.10) and raise it.** Two reasons to be
+more cautious than a stock-Wan2.1 guide would suggest: the rescaling
+polynomial was fitted on stock Wan2.1, not on this 4-stream fine-tune, and
+in conditioned modes part of the timestep embedding is pinned to a
+constant, which dilutes the measured drift and makes any given threshold
+skip more eagerly than it would elsewhere.
+
+Requires `cfg_scale=1.0`. Above that the DiT runs twice per step and one
+cache would mix the two passes, so it refuses rather than corrupt.
+
+### 3. `compile_dit` — worth trying, size unverified
+
+`torch.compile` on the DiT, already implemented — just off by default.
+
+The three things that could have made it useless here were checked and all
+came back clean. Dynamo traces **zero graph breaks** through FP8Linear,
+through peft called with per-row `adapter_names` (UniVidX's four-adapter
+dispatch), and through a plain Linear baseline; a compiled module also
+survived a CPU↔GPU offload/onload cycle, which is what VRAM management
+does every step. Changing sequence lengths — which context windowing
+produces, since the last window can be shorter — were handled without a
+recompile storm.
+
+So it should work. What is **not** verified is the payoff: the "20-30%"
+figure is inherited, not measured on this model. Turn it on, compare
+wall-clock, keep it if it earns its place.
+
+Two practical notes. The first sampler step pays the compile cost — tens
+of seconds at minimum, likely a couple of minutes for a 40-block 14B DiT —
+so it only makes sense on long runs, and it is wasted on a 4-step distilled
+render. And `mode="reduce-overhead"` normally means CUDA Graphs, but it is
+paired with `dynamic=True`, which generally prevents graph capture; the
+practical effect is probably inductor codegen without the CUDA-graph win.
+If you want to experiment, a fixed-shape batch with `dynamic=False` is the
+variant most likely to beat it.
+
+### 4. `attention_backend` — a few percent at most
+
+Do not expect much. UniVidX hardcodes SDPA, but torch's SDPA is *already*
+a fused FlashAttention kernel; forcing the naive math path on the same
+shape is 13x slower, which is what an actual missing optimisation would
+look like. Measured at Wan2.1-14B geometry on sm_86: SDPA 14.4 ms, FA2
+13.9 ms, SageAttention 16.7 ms. Sage was both slower and less exact there,
+so it is excluded from `auto` — but it is worth re-measuring on a
+different card.
+
+## What is not worth trying
+
+- **FlashAttention-3** — not installed in this environment.
+- **NVIDIA's Sol engine** — genuinely fast (2.3-2.8x) but it is an SGLang
+  serving stack validated on Cosmos/LTX/SANA, not Wan. It would be a port.
+- **Training a UniVidX turbo LoRA** — none exists publicly; a project in
+  its own right, and only worth it if step-distill proves unusable.
+"""
+
+
+def cache_options_help_markdown() -> str:
+    """Help page for the Cache Options node."""
+    return """# 🦇 UniVidX Cache Options
+
+Enables **TeaCache** on the Sample node. Wire this in and sampling gets
+faster; leave it unwired and nothing changes.
+
+Typical speedup is **1.4-1.9x**, and it does change your output — this is
+a quality trade, not a free win.
+
+## How it works
+
+At each denoising step TeaCache measures how far the modulated timestep
+embedding has moved since the last computed step. If the accumulated
+movement is below `rel_l1_thresh`, it **skips all 40 DiT blocks** and adds
+the previously cached residual instead. The first and last steps are
+always computed.
+
+So it exploits the fact that consecutive steps often barely differ. Push
+it too far and you skip steps that mattered.
+
+## `rel_l1_thresh` — the strength knob
+
+This is the only control, and it is the whole dial:
+
+| Value | Skipped (of 20 steps) | DiT speedup | Quality |
+|---|---|---|---|
+| `0.0` | 0 | 1.0x | Off — identical to not wiring the node. |
+| `0.03 - 0.08` | ~2-5 | ~1.1-1.3x | Cautious. Little visible change. |
+| `0.10 - 0.15` | ~6-10 | ~1.4-2.0x | Noticeably faster. Check albedo and normals. |
+| `0.20+` | 10+ | 2.0x+ | Aggressive. Temporal softening, lost detail. |
+
+**Read those speedups as indicative, not measured.** The arithmetic is
+exact — skipping *k* of *N* steps means `N / (N - k)` fewer DiT passes, so
+8 skipped of 20 is 20/12 = 1.67x — but which threshold produces which
+skip count depends on the clip, the mode, and the step count. A static
+scene skips far more than a fast pan at the same threshold.
+
+Two further reasons not to trust a table here: the speedups above are for
+the **DiT passes only**, while VAE encode/decode and text encoding never
+skip, so end-to-end gain is always lower; and the numbers assume 20 steps,
+so at 4 steps (with a distill LoRA) there is almost nothing to skip —
+first and last are always computed, leaving only 2 candidates.
+
+**So measure instead of guessing.** Every run logs what actually
+happened:
+
+```
+UniVidX_Sample: TeaCache: computed 12/20 DiT passes (skipped 8, 40%)
+                — 1.67x fewer DiT passes.
+```
+
+Raise the threshold, watch that line and the output, and stop when the
+damage shows.
+
+**Start lower here than a stock-Wan2.1 guide would tell you**, for two
+reasons specific to this model:
+
+1. The polynomial that rescales the measured drift was fitted on stock
+   Wan2.1, not on this four-stream fine-tune. Its calibration is
+   approximate here.
+2. In conditioned modes (`R2AIN` and friends) some rows of the timestep
+   embedding are **pinned to a constant** — the conditioning rows never
+   advance. Those constant rows drag the mean drift down, so the measured
+   movement understates the real change and any given threshold skips
+   more eagerly than the same number would on plain Wan2.1.
+
+Raise it until you can see the damage, then back off.
+
+## It costs VRAM — sometimes a lot
+
+TeaCache holds two full hidden-state tensors on the GPU for the whole
+run: `previous_hidden_states` and `previous_residual`. Each is
+`(4 streams, tokens, 5120)` in bf16, so the cost scales with resolution
+and window length:
+
+| window | hidden state | TeaCache holds |
+|---|---|---|
+| 880x1280 x81 | 3.5 GB | **~7.0 GB** |
+| 880x1280 x41 | 1.8 GB | ~3.7 GB |
+| 832x480  x81 | 1.2 GB | ~2.5 GB |
+
+That is on top of everything else, and it is why a job that renders fine
+without caching can OOM with it. If you are near the VRAM ceiling,
+TeaCache is the first thing to remove, not the last.
+
+## Not compatible with context windowing
+
+If the clip is long enough to be windowed, TeaCache is refused and the
+log says so. The cache keeps one residual and one step counter, but the
+model runs once per window per step — so the counter tracks windows
+rather than denoising steps, and the stored residual belongs to whichever
+window ran last. Reusing it across different parts of the clip would be
+wrong, and on the shorter final window it does not even have a matching
+shape.
+
+Raise `context_frames` until the clip fits a single pass if you want
+caching, or drop this node.
+
+## Requires guidance off
+
+TeaCache only engages when `cfg_scale` is 1.0. Above that the DiT runs
+twice per step (positive and negative), and a single cache shared across
+both would advance its step counter twice and blend the two passes'
+residuals together. Rather than corrupt the result, the sampler logs a
+warning and skips caching.
+
+In practice this is not a restriction: conditioned modes already force
+`cfg_scale=1.0` because their prompt is empty.
+
+## Why there is no step range here
+
+Other TeaCache implementations expose `start_step` / `end_step`. The one
+vendored with UniVidX does not — it takes only the threshold, and always
+computes the first and last step. Widgets for a range it ignores would be
+worse than not having them.
+
+## What to look for
+
+Compare against an uncached render of the same seed. Caching artefacts
+show up as **temporal smearing** — detail that should change between
+frames staying put — most visibly in irradiance and in fine normal-map
+detail. Flat albedo regions hide it well, so do not judge on those.
+"""
+
+
+def context_options_help_markdown() -> str:
+    """Help page for the Context Options node."""
+    return """# 🦇 UniVidX Context Options
+
+Overrides how long clips are split into overlapping temporal windows.
+
+**You usually do not need this node.** Windowing turns on automatically
+once a clip is longer than one window, using the defaults below. Wire this
+in only to change them.
+
+## Why windowing exists
+
+A single pass is bounded by VRAM, and UniVidX is unusually hungry: all
+four modality streams attend as one sequence, so cost grows with the
+square of the frame count. Around 81 frames at 720p you run out of card.
+
+Windowing samples overlapping chunks and blends them **inside the
+denoising loop** — at every step, not by cross-fading finished video — so
+joins are far less visible than stitching renders together.
+
+## Settings
+
+| Widget | Default | Notes |
+|---|---|---|
+| `context_frames` | 81 | Window length in pixel frames. 81 is Wan 2.1's native training length and the largest verified single pass. |
+| `context_overlap` | 16 | Frames shared between neighbours, cross-faded. Must be smaller than `context_frames`. |
+
+Both are pixel frames; they are converted to latent frames internally
+(4 pixel frames per latent, so 81 → 21 latent).
+
+## The cost
+
+Runtime scales with the **number of windows**, not the clip length. With
+81-frame windows and 16 overlap, each window advances 65 frames, so a
+161-frame clip is 3 windows ≈ 3x the render time of one 81-frame pass.
+Budget accordingly — and this is exactly why the step-distill LoRA on the
+loader matters so much for long clips.
+
+More overlap means smoother joins and more windows. Less overlap is faster
+and riskier.
+
+## Two known limitations
+
+**The last window can be short.** Upstream's tiler lets the final window
+run to whatever is left rather than shifting it back to full length, so a
+clip whose length is not a neat multiple may end on a window with much
+less context. If the last second of a render looks weaker than the rest,
+that is why — adjusting `context_frames` so the clip divides more evenly
+is the workaround.
+
+**Position encoding restarts per window.** Each window's temporal
+positions begin at zero rather than continuing the global timeline. This
+is inherited from the upstream implementation, not a local bug. Windows
+are joined only by the blend, so very long clips can drift in overall
+character from start to end. Overlap hides seams; it does not fix drift.
+"""
+
+
 # Map node id -> help markdown builder.
 _HELP_PAGES = {
+    "BAT_UniVidXLoader": loader_help_markdown,
     "BAT_UniVidXSample": sample_help_markdown,
     "BAT_UniVidXDecode": decode_help_markdown,
+    "BAT_UniVidXCacheOptions": cache_options_help_markdown,
+    "BAT_UniVidXContextOptions": context_options_help_markdown,
 }
 
 
