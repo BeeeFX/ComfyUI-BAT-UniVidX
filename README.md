@@ -91,7 +91,15 @@ Worth turning on, in order of payoff:
 | **Cache Options** (TeaCache) | ~1.4–1.9× on 20-step renders. | Several GB of VRAM (~7 GB at 880×1280×81) and some fidelity. First thing to remove if you're near the ceiling. Pointless below ~8 steps. |
 | **`compile_dit`** | Some per-step speedup. | Tens of seconds compiling on the first step. Not worth it on short or 4-step runs. |
 
-`vram_buffer_gb` is the one to reach for when you OOM: it's how much VRAM to keep **free** for the sampler, so *raise* it for more headroom. Auto-sizes from your card by default.
+**`vram_buffer_gb` is the block-swapping dial**, and the one to reach for when you OOM. It's how much VRAM to keep **free** for the sampler — layers past the limit stream CPU↔GPU on demand — so *raise* it for more headroom, lower it for speed.
+
+| | Value |
+|---|---|
+| Recommended | `0` = auto — sized from your card, and logged at load (~39 GB on a 95 GB card) |
+| Min / max | `0.0`–`80.0`, but the useful manual range is ~8 up to about (card VRAM − 16 GB) |
+| Typical manual | roughly a third of the card |
+
+FP8 and block swapping work together — quantised layers stay fp8 in every state *and* keep streaming, so the resident copy is 1 byte per parameter. (They used to be mutually exclusive; quantisation replaced the wrappers that did the streaming.)
 
 **Long clips**: peak VRAM is set by the **window**, not the clip. A 300-frame render in 81-frame windows costs the same per pass as an 81-frame one — it just does more passes. If you OOM, lower `context_frames`; if it's slow, that's the window count.
 

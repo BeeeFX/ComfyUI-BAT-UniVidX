@@ -239,15 +239,39 @@ Only override if auto guesses wrong. **If you OOM during sampling, raise
 it** — the failure means the model fitted but the sampler's peak
 allocation did not.
 
-Two things make that peak unusually large here. UniVidX attends over all
-four modality streams as a single sequence, so one step can request 20+ GB
-at 81 frames. And FP8-quantised layers **cannot be offloaded at all** —
-quantisation replaces the wrappers that do the streaming — so on an FP8
-run this reservation is the only protection the sampler has.
+The peak is unusually large here because UniVidX attends over all four
+modality streams as a single sequence — one step can request 20+ GB at
+81 frames.
 
 A worked example: a 95 GB card at the old fixed default of 4.0 GB left a
 91 GB limit, so ~48 GB of DiT stayed resident and a 24 GB allocation died
 with 20 MiB free. Auto now reserves ~39 GB on that card.
+
+### This is the block-swapping dial
+
+Layers past the limit are streamed CPU↔GPU on demand, so the reservation
+decides how much of the model stays resident.
+
+| | Value | Notes |
+|---|---|---|
+| **Recommended** | `0` = auto | Sized from the card, the dtype and whether FP8 is on. Logged at load. |
+| Minimum | `0.0` | Which *means* auto. The smallest useful **manual** value is around **8** — below that essentially nothing streams and you are relying on the model simply fitting. |
+| Maximum | `80.0` | But the practical ceiling is about **(card VRAM − 16 GB)**. Reserve past that and there is no room for the DiT itself, so every layer thrashes and throughput collapses. |
+| Typical manual | ~⅓ of the card | e.g. 24–32 on a 95 GB card if you want to override auto. |
+
+Which way to move it:
+
+- **OOM at sample time** (model loaded, sampler's peak did not fit) → **raise** it. That is the fix.
+- **Runs but feels slow, and you know the job fits** → **lower** it, so less streams.
+- Unsure → leave it at auto and read the logged value.
+
+**FP8 and block swapping now work together.** They used to be mutually
+exclusive: quantisation replaced the wrappers that do the streaming, so
+FP8 halved the DiT's bytes and simultaneously pinned every layer resident.
+Quantised layers now keep their offload machinery and stay fp8 in *every*
+state — so the GPU-resident copy is 1 byte per parameter too, not just the
+offloaded one. Numerics are unchanged from the old FP8 path (measured
+identical), and biases and LoRA adapters stay bf16.
 
 ## What's on by default
 

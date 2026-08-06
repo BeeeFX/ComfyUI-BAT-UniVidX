@@ -622,40 +622,28 @@ def load_model(
                     "vram_buffer_gb has no effect on this build.",
                 )
 
-            # FP8 substitution: runs AFTER enable_vram_management, and has
-            # to stay there. This ordering has a REAL COST, documented here
-            # because it's counter-intuitive and was nearly "fixed" wrongly.
+            # FP8 runs AFTER enable_vram_management, deliberately: it now
+            # converts the wrappers that call installed rather than
+            # replacing them, so the layers end up FP8 *and* still
+            # streamable. Quantizing first would leave nothing to convert.
             #
-            # The cost: enable_vram_management wraps each nn.Linear in an
-            # AutoWrappedLinear holding the offload/onload device config
-            # that streams the layer CPU<->GPU. Quantizing afterwards
-            # replaces those wrappers with our FP8Linear, discarding the
-            # streaming config — so every quantized layer becomes
-            # permanently GPU-resident. FP8 halves the DiT's bytes but
-            # simultaneously pins it.
+            # This used to be a genuine either/or. The old path swapped
+            # AutoWrappedLinear out for a plain FP8Linear, which has no
+            # offload/onload, so every quantized layer pinned itself to
+            # the GPU — FP8 halved the DiT's bytes and simultaneously made
+            # them immovable.
             #
-            # Why not quantize first, so the wrapper goes on top? Because
-            # DiffSynth's AutoWrappedLinear has its OWN fp8 path
-            # (`enable_fp8`, `fp8_linear()`) that derives scales
-            # dynamically from the input, and its forward() does
-            # `computation()` -> `linear_forward()` with no knowledge of
-            # our per-tensor `scale_weight` buffer. Wrapping an already-
-            # quantized FP8Linear would therefore compute numerically
-            # wrong results — silently. (It wouldn't even match the
-            # module_map today: FP8Linear subclasses nn.Module, not
-            # nn.Linear, so `isinstance(module, torch.nn.Linear)` is
-            # False and it'd be skipped entirely. Making it an nn.Linear
-            # subclass to "fix" that is the trap — it converts a
-            # no-op into wrong numbers.)
-            #
-            # So: FP8 reduces resident bytes but forfeits streaming for
-            # those layers. That is why vram_buffer sizing (above) matters
-            # so much on FP8 runs — the reservation is the only remaining
-            # lever for the sampler's peak allocation. Making FP8 and
-            # streaming co-exist means teaching FP8Linear to satisfy
-            # DiffSynth's AutoTorchModule contract (offload/onload/
-            # computation hooks honouring scale_weight); that's a real
-            # piece of work, not a reorder.
+            # One trap worth recording, since it looks like the obvious
+            # fix and is not: do NOT make FP8Linear an nn.Linear subclass
+            # so DiffSynth's module_map picks it up. AutoWrappedLinear has
+            # its own fp8 path (`enable_fp8`, `fp8_linear()`) that derives
+            # scales dynamically from the input, and its forward does
+            # computation() -> linear_forward() knowing nothing about a
+            # per-tensor scale_weight. Wrapping an already-quantized
+            # FP8Linear that way computes silently wrong numbers. The
+            # working approach is the reverse — subclass AutoWrappedLinear
+            # and override linear_forward to apply the scale, which is
+            # what fp8_loader.make_streamable_fp8_class does.
             if fp8_quantize == "qfloat8_prequantized":
                 adv_mod.apply_fp8_substitution(model, variant)
 
