@@ -41,8 +41,19 @@
 import { app } from "/scripts/app.js";
 
 // Nodes that get the help affordances. Decode is included because the
-// mode reference explains what its four output slots mean per family.
-const HELP_NODES = new Set(["BAT_UniVidXSample", "BAT_UniVidXDecode"]);
+// mode reference explains what its four output slots mean per family;
+// the Loader because every speed/quality knob lives on it and the
+// tooltips alone can't carry the tradeoffs.
+const HELP_NODES = new Set([
+    "BAT_UniVidXLoader",
+    "BAT_UniVidXSample",
+    "BAT_UniVidXDecode",
+    // The two options nodes carry the quality-for-speed trades, so the
+    // explanation has to be reachable FROM them — a user who drops in
+    // Cache Options shouldn't have to know the Loader's help covers it.
+    "BAT_UniVidXCacheOptions",
+    "BAT_UniVidXContextOptions",
+]);
 // PrimeIcons `pi-question-circle`. Written as an escape rather than a raw
 // glyph so it survives editors and encoding round-trips intact.
 const PI_QUESTION_CIRCLE = "\ue959";

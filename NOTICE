@@ -23,16 +23,36 @@ files. We acknowledge the original authors' work and re-license this
 combined work under GPL v3 so the chain stays consistent.
 
 ────────────────────────────────────────────────────────────────────────
-Runtime dependencies (NOT redistributed by this repo)
+Redistributed source (vendored in this repo)
 ────────────────────────────────────────────────────────────────────────
 
 UniVidX — Unified video intrinsic decomposition + matting
   https://github.com/houyuanchen111/UniVidX
+  Copyright The UniVidX Authors
   Apache License 2.0
-  Cloned into ./UniVidX/ by the wrapper on first node use; this repo
-  does not vendor or redistribute its source. Upstream-side patches
-  (a missing __init__.py and a soft-import of torchvision.io.write_video)
-  are applied automatically post-clone so the user never has to.
+
+  VENDORED into ./UniVidX/ at commit 382b9002757f4d5f04a90ec23b784dce11d56221.
+  Its source IS redistributed with this repo. The Apache 2.0 license text
+  is kept at ./UniVidX/LICENSE and those files remain under Apache 2.0;
+  only the wrapper around them is GPL v3. Apache 2.0 permits this
+  combination.
+
+  Modifications to the vendored copy are listed in ./UniVidX/VENDORED.md,
+  as Apache 2.0 §4(b) requires. In summary: the LICENSE file was added
+  (the pinned commit predates upstream committing one), the ~12 MB
+  assets/ demo directory and the nested .git were removed, and an empty
+  src/pipelines/__init__.py was added. No upstream source file is edited
+  — the wrapper's behavioural fixes are applied as runtime patches from
+  unividx_wrapper_runtime/advanced.py.
+
+  It used to be cloned on first node use instead. That was changed
+  because deploys with `rsync --delete` erased the clone while leaving
+  its .git behind, and because it removed a network fetch from the
+  render path.
+
+────────────────────────────────────────────────────────────────────────
+Runtime dependencies (NOT redistributed by this repo)
+────────────────────────────────────────────────────────────────────────
 
 Wan2.1-T2V-14B (Tongyi Wanxiang / Alibaba) — Video diffusion backbone
   https://github.com/Wan-Video/Wan2.1
@@ -56,6 +76,17 @@ mmgp (modelscope) — Memory-mapped GPU-friendly safetensors loading
   for the FP8 weight-load path.
 
 SageAttention (optional)
-  Installed by the user when prefer_sage_attn is enabled on the loader.
-  The wrapper monkey-patches DiffSynth's attention dispatcher to prefer
-  it when present.
+  Selected via the loader's attention_backend widget. The wrapper
+  replaces UniVidX's hardcoded-SDPA attention with a dispatcher that can
+  route to SageAttention or FlashAttention-2 when either is importable.
+
+FlashAttention-2 (optional)
+  https://github.com/Dao-AILab/flash-attention
+  BSD 3-Clause. Used by the same dispatcher; preferred by the `auto`
+  attention_backend setting when importable.
+
+ComfyUI-WanVideoWrapper (reference only, no code copied)
+  https://github.com/kijai/ComfyUI-WanVideoWrapper — Apache License 2.0
+  Its context_windows implementation and WanVideoContextOptions node
+  informed this pack's context-window defaults (81-frame windows, 16
+  frames of overlap) and the options-node UX. No source was copied.
