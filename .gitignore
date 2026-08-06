@@ -1,5 +1,23 @@
-# Vendored upstream — auto-cloned on first node use, not committed.
-UniVidX/
+# Vendored upstream — UniVidX/ IS committed (pinned at 382b9002, see
+# auto_clone.UNIVIDX_PINNED_COMMIT). It used to be auto-cloned on first
+# use and gitignored, but comfyctl deploys with `rsync --delete`: RND had
+# no UniVidX/, so every deploy wiped the destination's clone while leaving
+# .git behind, and auto_clone only tested for .git — so it declared the
+# tree present and the loader died on `No module named 'src.pipelines'`.
+# Vendoring gives rsync a source for these files and removes the
+# render-time dependency on GitHub being reachable from every worker.
+#
+# Trimmed vs a bare clone: upstream's assets/ (12 MB of demo mp4s + a
+# teaser png, referenced by nothing) is dropped, and the nested .git is
+# stripped so this isn't a repo-in-a-repo. 25 MB -> ~900 KB.
+#
+# To bump the pin: re-clone at the new commit, strip .git, drop assets/,
+# and update UNIVIDX_PINNED_COMMIT.
+#
+# These two are symlink holders the wrapper creates at load time (they
+# point into ComfyUI/models/unividx/) — never track their contents.
+UniVidX/models/
+UniVidX/checkpoints/
 
 # Local model cache (lives under ComfyUI/models/unividx/ anyway, but if
 # anyone symlinks it here, don't track the weights).
