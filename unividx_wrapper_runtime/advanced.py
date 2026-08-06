@@ -75,6 +75,9 @@ def _warn_if_lora_looks_mismatched(lora_name: str) -> None:
             "keys to match; check the merge report below.",
             lora_name,
         )
+
+
+def resolve_step_distill_path(lora_name: str) -> Optional[str]:
     """Resolve a `distill_lora` dropdown selection to an absolute path.
 
     `lora_name` is a name from `folder_paths.get_filename_list("loras")`,
@@ -192,12 +195,63 @@ def apply_fp8_substitution(model, variant: str) -> None:
     Both paths land at the same end state: ~400 FP8Linear modules
     inside the DiT, LoRA adapters preserved at BF16, ~14 GB DiT VRAM
     (vs ~28 GB BF16).
+
+    Preferred over both, when VRAM management has already wrapped the
+    DiT: convert those wrappers in place instead of replacing them, so
+    the layers stay FP8 *and* keep block swapping. See
+    `_apply_fp8_keeping_block_swap`.
     """
+    if _apply_fp8_keeping_block_swap(model):
+        return
     fp8_path = resolve_fp8_weights_path()
     if fp8_path is not None:
         _apply_fp8_substitution_from_file(model, fp8_path)
     else:
         _apply_fp8_substitution_runtime_quantize(model)
+
+
+def _apply_fp8_keeping_block_swap(model) -> bool:
+    """Quantize the DiT while preserving DiffSynth's block swapping.
+
+    Returns True if this path handled it, False to fall through to the
+    substitution paths (which pin the quantized layers to the GPU).
+
+    Background: `enable_vram_management` wraps each nn.Linear in an
+    `AutoWrappedLinear` that owns the CPU<->GPU streaming. The older FP8
+    path then REPLACED those wrappers with plain `FP8Linear` modules,
+    which have no offload/onload — so FP8 halved the DiT's bytes and
+    simultaneously pinned every one of them resident. You could have
+    small weights or streamable weights, not both.
+
+    Converting the wrapper in place keeps its device/dtype configuration
+    and its state machine, and stores the weight as fp8 in *every* state
+    — so the GPU-resident copy is 1 byte/param as well, not just the
+    offloaded one. That is the difference that matters here, since the
+    constraint is GPU memory rather than host RAM.
+    """
+    dit = getattr(getattr(model, "pipe", None), "dit", None)
+    if dit is None:
+        return False
+
+    from .fp8_loader import quantize_wrapped_dit_inplace
+
+    report = quantize_wrapped_dit_inplace(dit)
+    n = report["linears_quantized"]
+    if n == 0:
+        # No wrappers found — VRAM management is off, or DiffSynth's
+        # layer module isn't importable. The substitution paths still
+        # give the memory win, just without streaming.
+        return False
+
+    logger.info(
+        "UniVidX: FP8 applied to %d Linears with block swapping intact "
+        "(weights stay fp8 on GPU and can still stream to CPU). "
+        "LoRA adapters and biases remain bf16.%s",
+        n,
+        (f" {report['skipped_unwrapped']} unwrapped Linears left at bf16."
+         if report["skipped_unwrapped"] else ""),
+    )
+    return True
 
 
 def _apply_fp8_substitution_runtime_quantize(model) -> None:
