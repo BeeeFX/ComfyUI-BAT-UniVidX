@@ -444,3 +444,141 @@ def load_fp8_state_dict_into(model: nn.Module, state_dict: dict) -> dict:
         "unmatched_keys": unmatched,
         "missing_keys": truly_missing,
     }
+
+
+# ─── FP8 that survives block swapping ───────────────────────────────────────
+
+
+def _autowrapped_linear_cls():
+    """DiffSynth's AutoWrappedLinear, or None if unavailable."""
+    try:
+        from diffsynth.core.vram.layers import AutoWrappedLinear
+        return AutoWrappedLinear
+    except ImportError:
+        return None
+
+
+def make_streamable_fp8_class():
+    """Build `AutoWrappedFP8Linear`, or return None if DiffSynth's VRAM
+    layer isn't importable.
+
+    Why this exists: `FP8Linear` above is a plain `nn.Module`, so
+    substituting it for DiffSynth's `AutoWrappedLinear` throws away the
+    offload/onload machinery — quantized layers stop streaming and pin
+    themselves to the GPU. You got FP8's smaller footprint *or* block
+    swapping, never both, and on this model the sampler's peak is large
+    enough to want both.
+
+    This subclasses `AutoWrappedLinear` instead, so every state
+    transition (offload / onload / preparing / computation) is inherited
+    untouched. All we add is the dequantize on the way into the matmul.
+
+    Two details that are easy to get wrong:
+
+    * **The scale is a plain Python float, not a buffer.**
+      `nn.Module.to(dtype=...)` casts every floating-point buffer, and
+      `offload()` calls exactly that with `float8_e4m3fn`. A registered
+      scale buffer would be quantized to fp8 on the first offload and
+      silently corrupt every subsequent forward.
+
+    * **The bias is taken out of the fp8 path entirely.** It is a
+      per-tensor-scaled *weight* quantization; the bias has its own,
+      much smaller magnitude and no scale of its own, so casting it to
+      fp8 alongside the weight measurably degrades it (~2.8% on a
+      representative layer) for no memory worth having — all the biases
+      in a 14B DiT come to a few MB. It is de-registered as a Parameter
+      so `Module.to(dtype=...)` cannot reach it, kept at the compute
+      dtype, and re-attached in `linear_forward`.
+    """
+    base = _autowrapped_linear_cls()
+    if base is None:
+        return None
+
+    class AutoWrappedFP8Linear(base):  # type: ignore[misc,valid-type]
+        """AutoWrappedLinear holding a per-tensor-scaled FP8 weight."""
+
+        @classmethod
+        def convert(cls, wrapped) -> "AutoWrappedFP8Linear":
+            """Quantize an existing AutoWrappedLinear in place.
+
+            In place, rather than building a replacement, so the
+            offload/onload device+dtype configuration DiffSynth already
+            computed for this layer carries over exactly.
+            """
+            w_f32 = wrapped.weight.data.to(torch.float32)
+            abs_max = w_f32.abs().max().item()
+            scale = 1.0 if abs_max < 1e-12 else abs_max / FP8_E4M3_MAX
+
+            wrapped.weight.data = (w_f32 / scale).to(torch.float8_e4m3fn)
+
+            bias = None
+            if wrapped.bias is not None:
+                bias = wrapped.bias.data.detach().clone()
+                # register_parameter(None) is the supported way to drop a
+                # Parameter; plain `self.bias = None` raises.
+                wrapped.register_parameter("bias", None)
+
+            wrapped.__class__ = cls
+            wrapped._fp8_scale = float(scale)
+            wrapped._fp8_bias = bias
+            # Keep the weight fp8 through every state, so the GPU-resident
+            # copy is 1 byte/param too — not just the offloaded one.
+            wrapped.offload_dtype = torch.float8_e4m3fn
+            wrapped.onload_dtype = torch.float8_e4m3fn
+            wrapped.preparing_dtype = torch.float8_e4m3fn
+            return wrapped
+
+        def linear_forward(self, x, weight, bias):
+            # `weight` arrives from computation() cast to the compute
+            # dtype; undo the quantization scale, then add the bias we
+            # kept out of it.
+            w = weight.to(x.dtype) * self._fp8_scale
+            b = self._fp8_bias
+            if b is not None and (b.device != x.device or b.dtype != x.dtype):
+                b = b.to(device=x.device, dtype=x.dtype)
+                self._fp8_bias = b  # cache the move; biases are tiny
+            return torch.nn.functional.linear(x, w, b)
+
+    return AutoWrappedFP8Linear
+
+
+def quantize_wrapped_dit_inplace(model: nn.Module) -> dict:
+    """Convert every AutoWrappedLinear in `model` to a streamable FP8 one.
+
+    Mirrors `quantize_dit_inplace`'s PEFT handling: descend into a
+    wrapper holding a `.base_layer` and convert only that, never
+    recursing into its `lora_A` / `lora_B` siblings. Those are rank-32
+    and quantizing them wins no memory while hurting adapter quality —
+    and UniVidX's four per-modality adapters are the whole model.
+
+    Returns `{"linears_quantized": int, "skipped_unwrapped": int}`.
+    `skipped_unwrapped` counts plain nn.Linears found with no wrapper,
+    which means VRAM management was not enabled for them.
+    """
+    cls = make_streamable_fp8_class()
+    base = _autowrapped_linear_cls()
+    if cls is None or base is None:
+        return {"linears_quantized": 0, "skipped_unwrapped": 0}
+
+    counts = {"linears_quantized": 0, "skipped_unwrapped": 0}
+
+    def _is_target(m) -> bool:
+        return isinstance(m, base) and not isinstance(m, cls)
+
+    def _walk(module: nn.Module) -> None:
+        for _name, child in list(module.named_children()):
+            inner = getattr(child, "base_layer", None)
+            if not _is_target(child) and _is_target(inner):
+                child.base_layer = cls.convert(inner)
+                counts["linears_quantized"] += 1
+                continue  # do NOT recurse: lora_A/lora_B stay bf16
+            if _is_target(child):
+                cls.convert(child)
+                counts["linears_quantized"] += 1
+                continue
+            if isinstance(child, nn.Linear) and not isinstance(child, base):
+                counts["skipped_unwrapped"] += 1
+            _walk(child)
+
+    _walk(model)
+    return counts
