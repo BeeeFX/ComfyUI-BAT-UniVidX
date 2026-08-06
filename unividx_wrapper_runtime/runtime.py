@@ -29,6 +29,7 @@ Owns:
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import sys
@@ -71,20 +72,409 @@ def unividx_cwd(upstream_dir: str):
         os.chdir(prev)
 
 
-def _import_pipeline_class(variant: str):
+@contextlib.contextmanager
+def _own_the_src_name(upstream_dir: str):
+    """Temporarily point `sys.modules['src']` at UniVidX's own `src/`
+    package, restoring whatever was there on the way out.
+
+    Why this is necessary: `src` is a catastrophically generic
+    top-level package name, and several unrelated custom nodes ship
+    one — `comfyui_controlnet_aux`, both copies of
+    `SeedVR2_VideoUpscaler` (whose `src/interfaces/comfyui_node.py`
+    does `from src.…` at ComfyUI startup), and any third-party
+    UniVidX wrapper. Whichever loads first wins `sys.modules['src']`,
+    and it is NOT us: ComfyUI walks custom_nodes alphabetically and
+    imports every node at boot, long before a graph runs.
+
+    Adding our directory to sys.path is not enough. sys.path is only
+    consulted for names that aren't already in sys.modules, so once
+    another node owns `src`, `import src.pipelines.univid_intrinsic`
+    resolves `pipelines` as a child of THEIR package, doesn't find
+    it, and raises `ModuleNotFoundError: No module named
+    'src.pipelines'` — pointing at a file that is present on disk.
+
+    So we bind the name ourselves for the duration of the import.
+    Upstream's modules do `from src.pipelines…` internally, so the
+    name genuinely has to be `src` while they execute; importing the
+    file under a private alias alone would break those internal
+    imports. We also drop any `src.*` submodules the other node had
+    cached, or Python would serve theirs from cache mid-import, and
+    restore the exact previous state in `finally`.
+
+    Not thread-safe, for the same reason `unividx_cwd()` isn't:
+    ComfyUI's default worker runs prompts serially.
+    """
+    import importlib
+
+    saved = {k: v for k, v in sys.modules.items()
+             if k == "src" or k.startswith("src.")}
+    for k in saved:
+        del sys.modules[k]
+
+    # Import our `src` explicitly by path so the resolution can't be
+    # hijacked by sys.path ordering either.
+    src_dir = os.path.join(upstream_dir, "src")
+    init_py = os.path.join(src_dir, "__init__.py")
+    if not os.path.isfile(init_py):
+        raise RuntimeError(
+            f"UniVidX: expected {init_py} to exist (auto_clone creates it). "
+            "The upstream clone looks incomplete — delete "
+            f"{upstream_dir!r} and re-run to force a fresh clone."
+        )
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "src", init_py, submodule_search_locations=[src_dir],
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["src"] = module
+        spec.loader.exec_module(module)
+        if saved:
+            logger.info(
+                "UniVidX: temporarily rebound the top-level 'src' module "
+                "name (another custom node owns it: %s). This is expected.",
+                ", ".join(sorted(saved)[:3]) + ("…" if len(saved) > 3 else ""),
+            )
+        yield
+    finally:
+        for k in [k for k in sys.modules
+                  if k == "src" or k.startswith("src.")]:
+            del sys.modules[k]
+        sys.modules.update(saved)
+
+
+def _import_pipeline_class(variant: str, upstream_dir: str):
     """Direct import of UniVidX's pipeline class — bypasses
     `scripts.registry` entirely so we don't pull trainer code with
     its torchvision-version-fragile imports.
 
+    Wrapped in `_own_the_src_name()` because the bare top-level name
+    `src` is contested by several other custom nodes; see there.
+
     Returns the class object (UniVidIntrinsic or UniVidAlpha).
     """
-    if variant == "intrinsic":
-        from src.pipelines.univid_intrinsic import UniVidIntrinsic  # type: ignore
-        return UniVidIntrinsic
-    if variant == "alpha":
+    if variant not in ("intrinsic", "alpha"):
+        raise ValueError(f"variant must be 'intrinsic' or 'alpha', got {variant!r}")
+    with _own_the_src_name(upstream_dir):
+        if variant == "intrinsic":
+            from src.pipelines.univid_intrinsic import UniVidIntrinsic  # type: ignore
+            return UniVidIntrinsic
         from src.pipelines.univid_alpha import UniVidAlpha  # type: ignore
         return UniVidAlpha
-    raise ValueError(f"variant must be 'intrinsic' or 'alpha', got {variant!r}")
+
+
+# ── Pipeline constructor arguments ──────────────────────────────────────────
+# UniVidIntrinsic/UniVidAlpha.__init__ defaults EVERY argument to None, and a
+# bare `PipelineCls()` silently produces a crippled pipeline:
+#
+#   model_paths=None          -> model_configs == [] -> WanVideoPipeline gets
+#                                no T5 and no VAE. Logs "No wan_video_text_
+#                                encoder models available." then dies at
+#                                sample time with
+#                                `'NoneType' object has no attribute 'encode'`.
+#   lora_modalities=None      -> the add_multiple_loras_to_model() branch is
+#                                skipped, so the per-modality DGL adapters
+#                                (the whole point of UniVidX) are absent.
+#   resume_from_checkpoint    -> the UniVidX checkpoint is never loaded, so
+#                     =None      the DiT stays vanilla Wan2.1-T2V-14B.
+#
+# The last two fail SILENTLY — you get plausible-looking Wan2.1 video instead
+# of an intrinsic/alpha decomposition. Hence _assert_pipeline_fully_wired().
+#
+# Values mirror upstream's own configs/univid_{intrinsic,alpha}_inference.yaml
+# verbatim; they are not tuning knobs.
+_LORA_TARGET_MODULES = "self_attn.q,self_attn.k,self_attn.v,self_attn.o,ffn.0,ffn.2"
+_LORA_RANK = 32
+
+# Per-variant LoRA adapter names. These are the `adapter_name`s the
+# checkpoint's keys are namespaced under, so they must match the checkpoint
+# exactly — not the wrapper's own socket names. Note the alpha family uses
+# "com" here while our IMAGE socket for the same modality is "rgb".
+_LORA_MODALITIES = {
+    "intrinsic": ["rgb", "albedo", "irradiance", "normal"],
+    "alpha": ["com", "pha", "fgr", "bgr"],
+}
+
+# T5 text encoder, in filename preference order, and the VAE. Same names
+# auto_download._WAN_REQUIRED_FILES verifies, kept in sync deliberately:
+# that module proves they're on disk, this one hands them to the pipeline.
+_T5_FILENAMES = (
+    "models_t5_umt5-xxl-enc-bf16.pth",
+    "models_t5_umt5-xxl-enc-fp32.pth",
+)
+_VAE_FILENAME = "Wan2.1_VAE.pth"
+
+
+def _pipeline_kwargs(variant: str, wan21_path: str, ckpt_path: str) -> dict:
+    """Build the full keyword-argument set for the pipeline constructor.
+
+    Paths are passed ABSOLUTE. Upstream's configs use paths relative to
+    the UniVidX root (which is why we chdir via `unividx_cwd()` and
+    symlink into it), but absolute paths work regardless of cwd and give
+    a readable error if a file moves. The one thing we cannot make
+    absolute is the tokenizer: the constructor hardcodes
+    `models/Wan-AI/Wan2.1-T2V-14B/google/umt5-xxl` internally, so the
+    chdir + symlinks are still load-bearing for that.
+    """
+    t5 = None
+    for name in _T5_FILENAMES:
+        candidate = os.path.join(wan21_path, name)
+        if os.path.isfile(candidate):
+            t5 = candidate
+            break
+    if t5 is None:
+        raise RuntimeError(
+            f"UniVidX: no T5 text encoder found in {wan21_path!r}. Expected "
+            f"one of {', '.join(_T5_FILENAMES)}. Without it the pipeline "
+            "loads no text encoder and sampling dies with "
+            "\"'NoneType' object has no attribute 'encode'\"."
+        )
+
+    vae = os.path.join(wan21_path, _VAE_FILENAME)
+    if not os.path.isfile(vae):
+        raise RuntimeError(
+            f"UniVidX: {_VAE_FILENAME} missing from {wan21_path!r}. The "
+            "pipeline cannot encode conditioning frames or decode results "
+            "without it."
+        )
+
+    # The tokenizer directory the constructor reaches for via its own
+    # hardcoded relative path. Checked here so a missing tokenizer is a
+    # clear error rather than a confusing failure inside from_pretrained.
+    tokenizer_dir = os.path.join(wan21_path, "google", "umt5-xxl")
+    if not os.path.isdir(tokenizer_dir):
+        raise RuntimeError(
+            f"UniVidX: tokenizer directory missing at {tokenizer_dir!r}. It "
+            "ships inside the Wan2.1-T2V-14B repo under google/umt5-xxl; a "
+            "partial download is the usual cause. Delete the Wan2.1 folder "
+            "and let the loader re-fetch it."
+        )
+
+    if not os.path.isfile(ckpt_path):
+        raise RuntimeError(
+            f"UniVidX: checkpoint {ckpt_path!r} not found. Without it the "
+            "DiT stays vanilla Wan2.1 and you'd get ordinary video instead "
+            "of a decomposition."
+        )
+
+    # model_paths is JSON — the constructor does json.loads() on it.
+    return {
+        "model_paths": json.dumps([t5, vae]),
+        "lora_base_model": "dit",
+        "lora_target_modules": _LORA_TARGET_MODULES,
+        "lora_rank": _LORA_RANK,
+        "lora_modalities": _LORA_MODALITIES[variant],
+        "resume_from_checkpoint": ckpt_path,
+    }
+
+
+def _assert_pipeline_fully_wired(model: Any, variant: str) -> None:
+    """Fail loudly if the constructed pipeline is missing a text encoder,
+    a VAE, or its LoRA adapters.
+
+    Worth the belt-and-braces: two of the three failure modes above are
+    SILENT. A pipeline with no adapters and an unloaded checkpoint still
+    samples happily — it just produces vanilla Wan2.1 output, which looks
+    like a plausible result rather than a bug. Catching it at load time
+    turns a "why does this look wrong?" investigation into an error
+    message.
+    """
+    pipe = getattr(model, "pipe", None)
+    if pipe is None:
+        raise RuntimeError(
+            "UniVidX: constructed model has no `.pipe` — upstream's API "
+            "changed; the wrapper needs updating for this commit."
+        )
+
+    if getattr(pipe, "text_encoder", None) is None:
+        raise RuntimeError(
+            "UniVidX: pipeline built with no text encoder (model_paths "
+            "didn't reach WanVideoPipeline). Sampling would fail with "
+            "\"'NoneType' object has no attribute 'encode'\"."
+        )
+    if getattr(pipe, "vae", None) is None:
+        raise RuntimeError(
+            "UniVidX: pipeline built with no VAE — cannot encode "
+            "conditioning frames or decode results."
+        )
+
+    dit = getattr(pipe, "dit", None)
+    if dit is None:
+        raise RuntimeError("UniVidX: pipeline has no DiT.")
+    if not any("lora" in name.lower() for name, _ in dit.named_parameters()):
+        raise RuntimeError(
+            f"UniVidX: no LoRA parameters found on the DiT for variant "
+            f"{variant!r}. The per-modality DGL adapters are what make this "
+            "UniVidX rather than plain Wan2.1 — without them the node would "
+            "silently emit ordinary video. Expected adapters: "
+            f"{', '.join(_LORA_MODALITIES[variant])}."
+        )
+    logger.info(
+        "UniVidX: pipeline wired — text encoder + VAE present, LoRA "
+        "adapters attached (%s).", ", ".join(_LORA_MODALITIES[variant]),
+    )
+
+
+# ── VRAM buffer auto-sizing ─────────────────────────────────────────────────
+# DiffSynth's enable_vram_management(vram_buffer=N) computes
+# `vram_limit = total_card_vram - N` and offloads DiT layers to CPU to stay
+# under that limit. So `vram_buffer` is a RESERVATION: it's how much VRAM is
+# left free for everything that isn't resident weights — activations,
+# attention workspace, VAE decode.
+#
+# The old default of 4.0 was tuned for a 32 GB card holding an FP8 DiT with
+# little headroom needed. It is badly wrong on a big card: on a 95 GB card it
+# sets the limit to 91 GB, so ~48 GB of bf16 DiT stays resident and the first
+# sampler step (which wants 20+ GB in ONE allocation, because UniVidX attends
+# over four modality streams at once) dies with 20 MiB free.
+#
+# Sizing: reserve a fraction of the card, but never less than one observed
+# sampler step. The fraction (rather than a flat constant) is because the
+# activation cost scales with what people run on a given card — bigger cards
+# get used for bigger frame counts and resolutions.
+#
+# _SAMPLER_SPIKE_GB is measured, not guessed: farm job c8824e2c on a 95 GB
+# card at 21 frames / R2AIN requested 24.17 GiB in a SINGLE allocation while
+# 47.68 GiB of bf16 DiT sat resident. UniVidX attends over four modality
+# streams at once, so its peak is several times a plain Wan2.1 step. Treat
+# this as a floor for 21 frames — more frames will want more, which is why
+# the fraction takes over on big cards.
+_VRAM_RESERVE_FRACTION = 0.35
+_SAMPLER_SPIKE_GB = 26.0
+
+
+def total_vram_gb() -> Optional[float]:
+    """Total VRAM of the active CUDA device in GB, or None on CPU.
+
+    Uses the same source DiffSynth does (`mem_get_info()[1]`, i.e. TOTAL
+    not free) so our arithmetic matches theirs exactly.
+    """
+    if not torch.cuda.is_available():
+        return None
+    try:
+        return torch.cuda.mem_get_info()[1] / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def auto_vram_buffer_gb(*, fp8: bool) -> float:
+    """Pick a `vram_buffer` reservation for this card.
+
+    Returns GB to keep free. Larger reservation => more offloading =>
+    more room for the sampler's peak allocation.
+
+    `fp8` widens the reservation rather than narrowing it, for two
+    compounding reasons:
+
+      1. FP8 halves the DiT's resident bytes (~28 -> ~14 GB), so there
+         is simply more card left to hand to activations.
+      2. More importantly, FP8-quantized layers CANNOT be offloaded at
+         all under the current ordering — apply_fp8_substitution runs
+         after enable_vram_management and replaces its AutoWrappedLinear
+         wrappers (see the long comment at the call site). So on an FP8
+         run, DiffSynth's streaming is not available as a safety valve
+         and the reservation is the ONLY thing standing between the
+         sampler's peak allocation and an OOM.
+
+    Either way FP8 is not a reason to reserve less.
+    """
+    total = total_vram_gb()
+    if total is None:
+        # CPU-only: DiffSynth's limit arithmetic is irrelevant, and a
+        # nonzero buffer would just confuse its bookkeeping.
+        return 0.0
+    reserve = total * _VRAM_RESERVE_FRACTION
+    if fp8:
+        # FP8 frees ~14 GB of resident DiT; spend it on headroom.
+        reserve += 6.0
+    # Floor at one measured sampler step — a reservation smaller than the
+    # peak allocation OOMs no matter how neatly the weights fit.
+    reserve = max(reserve, _SAMPLER_SPIKE_GB)
+
+    # Ceiling: never reserve so much that the DiT itself can't stay
+    # resident enough to make progress. DiffSynth can stream layers from
+    # CPU, so a tight limit is slow rather than fatal — but leaving less
+    # than roughly one DiT's worth means thrashing every single step.
+    #
+    # On a card too small to hold BOTH the DiT and a full sampler spike
+    # (anything under ~40 GB at bf16), these two pull in opposite
+    # directions and there's no good answer: we favour the model fitting
+    # and let DiffSynth stream, because that at least runs. Such a card
+    # realistically needs FP8 plus fewer frames.
+    dit_gb = 14.0 if fp8 else 28.0
+    max_reserve = total - dit_gb
+    if max_reserve > 0:
+        reserve = min(reserve, max_reserve)
+    else:
+        # Card can't even hold the DiT. Reserve a token amount and let
+        # DiffSynth offload aggressively; the loader logs the value so a
+        # subsequent OOM is at least explainable.
+        reserve = min(reserve, max(1.0, total * 0.1))
+    return round(max(0.0, reserve), 1)
+
+
+def _coerce_attention_backend(value) -> str:
+    """Normalise the `attention_backend` setting, tolerating the boolean
+    this widget used to be.
+
+    It was `prefer_sage_attn` (BOOLEAN) and is now a combo. Because it is
+    the LAST widget in the loader's saved `widgets_values` array, swapping
+    it in place shifts nothing else — but workflows saved before the change
+    still hand us `False`/`True`. Map those to their intent rather than
+    failing: the graph keeps running, and the widget just needs re-picking
+    once in the UI.
+    """
+    if isinstance(value, bool):
+        return "sage" if value else "auto"
+    if isinstance(value, str) and value in adv_backends():
+        return value
+    if value is None:
+        return "auto"
+    logger.warning(
+        "UniVidX: unrecognised attention_backend %r; using 'auto'.", value,
+    )
+    return "auto"
+
+
+def build_tea_cache_for_run(model_instance, *, num_inference_steps: int,
+                            rel_l1_thresh: float):
+    """Sampler-facing wrapper around advanced.build_tea_cache.
+
+    Kept here so the sampler node has a single `runtime.` entry point and
+    doesn't need to import the torch-heavy advanced module directly.
+    Returns a fresh, single-use TeaCache, or None.
+    """
+    from . import advanced as _adv
+    return _adv.build_tea_cache(
+        model_instance,
+        num_inference_steps=num_inference_steps,
+        rel_l1_thresh=rel_l1_thresh,
+    )
+
+
+def instrument_vae_encode(model_instance, *, tiled: bool, tile_size,
+                          tile_stride) -> bool:
+    """Sampler-facing wrapper around advanced.instrument_vae_encode."""
+    from . import advanced as _adv
+    return _adv.instrument_vae_encode(
+        model_instance, tiled=tiled, tile_size=tile_size,
+        tile_stride=tile_stride,
+    )
+
+
+def tea_cache_report(tea_cache) -> Optional[str]:
+    """Sampler-facing wrapper around advanced.tea_cache_report."""
+    if tea_cache is None:
+        return None
+    from . import advanced as _adv
+    return _adv.tea_cache_report(tea_cache)
+
+
+def adv_backends() -> tuple:
+    """Indirection so the valid-backend list lives in one place
+    (advanced.ATTENTION_BACKENDS) without importing torch-heavy modules
+    at import time."""
+    from . import advanced as _adv
+    return _adv.ATTENTION_BACKENDS
 
 
 def load_model(
@@ -109,8 +499,9 @@ def load_model(
       distill_strength — float (0..1+), merge strength.
       compile_dit      — bool, torch.compile the DiT (~20-30% faster
                           per-step after first-call warmup).
-      prefer_sage_attn — bool, swap DiffSynth's attention impl to
-                          SageAttention-first with FA2/SDPA fallback.
+      attention_backend — "auto" | "sdpa" | "flash_attn_2" | "sage".
+                          UniVidX hardcodes SDPA; "auto" picks the
+                          fastest available (sage → FA2 → SDPA).
 
     The cache key includes every advanced knob so a change forces a
     rebuild. Loaded models go in the LRU; default size 1 (only one
@@ -127,7 +518,7 @@ def load_model(
     distill_lora = adv.get("distill_lora", "none") or "none"
     distill_strength = float(adv.get("distill_strength", 1.0))
     compile_dit_flag = bool(adv.get("compile_dit", False))
-    prefer_sage = bool(adv.get("prefer_sage_attn", False))
+    attention_backend = _coerce_attention_backend(adv.get("attention_backend", "auto"))
 
     cache_key = (
         variant,
@@ -136,7 +527,7 @@ def load_model(
         str(dtype),
         float(vram_buffer_gb),
         fp8_quantize, distill_lora, distill_strength,
-        compile_dit_flag, prefer_sage,
+        compile_dit_flag, attention_backend,
     )
 
     with _CACHE_LOCK:
@@ -176,20 +567,24 @@ def load_model(
             variant, wan21_path, ckpt_path, dtype, vram_buffer_gb,
         )
         with unividx_cwd(upstream_dir):
-            # Sage attention: install BEFORE pipeline construction so
-            # DiffSynth's freshly-imported wan_video_dit module has the
-            # wrapped flash_attention from the get-go.
-            if prefer_sage:
-                if not adv_mod.force_sage_over_fa2():
-                    logger.warning(
-                        "UniVidX: prefer_sage_attn=True but the "
-                        "SageAttention dispatcher could not be installed "
-                        "(likely cause: `sageattention` not importable). "
-                        "Continuing with default attention backend."
-                    )
+            PipelineCls = _import_pipeline_class(variant, upstream_dir)
 
-            PipelineCls = _import_pipeline_class(variant)
-            model = PipelineCls()
+            # Attention backend: install AFTER the pipeline class import,
+            # never before. We patch module globals through sys.modules, and
+            # `src.models.wan_video_dit_{intrinsic,alpha}` only exist once
+            # the pipeline module has pulled them in. The previous
+            # implementation ran before this line, so its patch found
+            # nothing and silently left the model on stock SDPA.
+            adv_mod.install_attention_backend(attention_backend)
+            model = PipelineCls(**_pipeline_kwargs(variant, wan21_path, ckpt_path))
+            _assert_pipeline_fully_wired(model, variant)
+
+            # Repair upstream's temporal tiler so the sampler can window
+            # long clips. Installed unconditionally: it only takes effect
+            # when the sampler actually passes sliding_window_* , and
+            # doing it here means the fix is part of the cached model
+            # rather than something the sampler has to remember.
+            adv_mod.install_sliding_window_support(model)
 
             # mmgp safetensors patch: read-only mmap for Windows.
             adv_mod.patch_unividx_load_file_to_readonly()
@@ -211,8 +606,10 @@ def load_model(
                 try:
                     pipe.enable_vram_management(vram_buffer=float(vram_buffer_gb))
                     logger.info(
-                        "UniVidX: VRAM management enabled (buffer=%.1f GB)",
+                        "UniVidX: VRAM management enabled (buffer=%.1f GB "
+                        "reserved for activations; %s)",
                         float(vram_buffer_gb),
+                        "FP8 DiT" if fp8_quantize != "none" else "bf16 DiT",
                     )
                 except TypeError as e:
                     logger.warning(
@@ -225,10 +622,40 @@ def load_model(
                     "vram_buffer_gb has no effect on this build.",
                 )
 
-            # FP8 substitution: runs AFTER vram_management — the
-            # FP8Linear modules slot in transparently because they
-            # have the same forward signature as nn.Linear. The
-            # existing wrapper does the same ordering.
+            # FP8 substitution: runs AFTER enable_vram_management, and has
+            # to stay there. This ordering has a REAL COST, documented here
+            # because it's counter-intuitive and was nearly "fixed" wrongly.
+            #
+            # The cost: enable_vram_management wraps each nn.Linear in an
+            # AutoWrappedLinear holding the offload/onload device config
+            # that streams the layer CPU<->GPU. Quantizing afterwards
+            # replaces those wrappers with our FP8Linear, discarding the
+            # streaming config — so every quantized layer becomes
+            # permanently GPU-resident. FP8 halves the DiT's bytes but
+            # simultaneously pins it.
+            #
+            # Why not quantize first, so the wrapper goes on top? Because
+            # DiffSynth's AutoWrappedLinear has its OWN fp8 path
+            # (`enable_fp8`, `fp8_linear()`) that derives scales
+            # dynamically from the input, and its forward() does
+            # `computation()` -> `linear_forward()` with no knowledge of
+            # our per-tensor `scale_weight` buffer. Wrapping an already-
+            # quantized FP8Linear would therefore compute numerically
+            # wrong results — silently. (It wouldn't even match the
+            # module_map today: FP8Linear subclasses nn.Module, not
+            # nn.Linear, so `isinstance(module, torch.nn.Linear)` is
+            # False and it'd be skipped entirely. Making it an nn.Linear
+            # subclass to "fix" that is the trap — it converts a
+            # no-op into wrong numbers.)
+            #
+            # So: FP8 reduces resident bytes but forfeits streaming for
+            # those layers. That is why vram_buffer sizing (above) matters
+            # so much on FP8 runs — the reservation is the only remaining
+            # lever for the sampler's peak allocation. Making FP8 and
+            # streaming co-exist means teaching FP8Linear to satisfy
+            # DiffSynth's AutoTorchModule contract (offload/onload/
+            # computation hooks honouring scale_weight); that's a real
+            # piece of work, not a reorder.
             if fp8_quantize == "qfloat8_prequantized":
                 adv_mod.apply_fp8_substitution(model, variant)
 

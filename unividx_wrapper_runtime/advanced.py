@@ -14,16 +14,20 @@
 # terms that carry through to this file.
 """Advanced perf knobs for the BAT UniVidX wrapper.
 
-Each function is opt-in: nothing here runs unless the loader's
-`advanced_settings` toggle is on AND the specific knob is set to
-a non-default value. The defaults match upstream UniVidX's tuning
-(bf16, no LoRA merge, no FP8, native SDPA), so users who don't touch
-the advanced panel get the same behaviour as v1.
+Each function is driven by its own loader widget; nothing here runs
+unless that widget asks for it.
+
+Two run by default because they cost nothing in quality: FP8 weight
+quantisation (a bf16 Wan2.1-14B DiT is ~28-32 GB and leaves no room for
+activations) and the attention-backend dispatcher. Everything that can
+alter output pixels — the step-distill LoRA merge, TeaCache — stays off
+until explicitly enabled.
 """
 from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -41,32 +45,56 @@ _attention_fallback_warned: set = set()
 # ─── Step-distill LoRA pre-merge ────────────────────────────────────────────
 
 
-def resolve_step_distill_path(lora_kind: str) -> Optional[str]:
-    """Locate a step-distill LoRA file on disk by kind. Returns None
-    if not found so the caller can surface a clear error.
+def _warn_if_lora_looks_mismatched(lora_name: str) -> None:
+    """Flag a LoRA whose filename suggests the wrong base model.
 
-    Search candidates per kind:
-      lightx2v: models/loras/lightx2v/loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors
-                (the layout `hf download lightx2v/Wan2.1-T2V-14B-StepDistill-CfgDistill-Lightx2v
-                 loras/...  --local-dir models/loras/lightx2v` produces)
-                Falls back to a flat copy at models/loras/lightx2v/<filename>.
+    Worth doing up front because the obvious safety net doesn't catch it.
+    The merge warns when ZERO keys match — but Wan2.1 I2V and T2V share
+    most of their DiT, so an I2V LoRA matches plenty of keys and merges
+    "successfully" while quietly degrading the result. A name check is
+    crude, but it catches the realistic mistake before a multi-minute
+    load rather than after an inexplicable render.
+
+    Only ever warns. The filename is a hint, not proof, and someone with
+    a correctly-working file that happens to be oddly named should not be
+    blocked by a substring match.
     """
-    root = Path(folder_paths.models_dir).parent  # ComfyUI root, not models/
-    if lora_kind == "lightx2v":
-        candidates = [
-            root / "models" / "loras" / "lightx2v" / "loras"
-            / "Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors",
-            root / "models" / "loras" / "lightx2v"
-            / "Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors",
-            root / "models" / "loras"
-            / "Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors",
-        ]
-    else:
+    low = lora_name.lower()
+    if ("i2v" in low) and ("t2v" not in low):
+        logger.warning(
+            "UniVidX: %r looks like an IMAGE-to-video LoRA, but UniVidX is "
+            "built on Wan2.1-T2V-14B. Wan2.1 I2V and T2V share most of the "
+            "DiT, so this will merge without an obvious error and then "
+            "quietly hurt quality. You probably want a *_T2V_14B_* file.",
+            lora_name,
+        )
+    if any(t in low for t in ("wan2.2", "wan22", "wan2_2")):
+        logger.warning(
+            "UniVidX: %r looks like a Wan 2.2 LoRA. This model's backbone is "
+            "Wan 2.1 (T2V-14B) — a different generation. Expect few or no "
+            "keys to match; check the merge report below.",
+            lora_name,
+        )
+    """Resolve a `distill_lora` dropdown selection to an absolute path.
+
+    `lora_name` is a name from `folder_paths.get_filename_list("loras")`,
+    i.e. whatever the user picked in the UI. This used to hunt for three
+    hardcoded filenames in four guessed directories, which meant the one
+    file actually present in this asset library
+    (…/loras/WAN21/…rank32.safetensors) went unfound and the feature could
+    never load. Letting ComfyUI resolve a real selection removes the
+    guesswork and works for any future distill LoRA.
+    """
+    if not lora_name or lora_name == "none":
         return None
-    for p in candidates:
-        if p.is_file():
-            return str(p)
-    return None
+    try:
+        return folder_paths.get_full_path("loras", lora_name)
+    except Exception as exc:
+        logger.warning(
+            "UniVidX: could not resolve LoRA %r via folder_paths (%s: %s).",
+            lora_name, type(exc).__name__, exc,
+        )
+        return None
 
 
 def apply_step_distill_merge(model, *, lora_kind: str, strength: float) -> None:
@@ -86,20 +114,22 @@ def apply_step_distill_merge(model, *, lora_kind: str, strength: float) -> None:
     path = resolve_step_distill_path(lora_kind)
     if path is None:
         raise FileNotFoundError(
-            f"Step-distill LoRA '{lora_kind}' not found on disk. "
-            f"Expected layout:\n"
-            f"  models/loras/lightx2v/loras/"
-            f"Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors\n\n"
-            f"Download via:\n"
+            f"Step-distill LoRA {lora_kind!r} could not be resolved under "
+            f"ComfyUI/models/loras/.\n\n"
+            f"The dropdown is populated from that folder, so this usually "
+            f"means the file was moved or deleted after the graph was "
+            f"saved. Re-pick it on the loader, or set distill_lora='none'.\n\n"
+            f"If you have none yet, a known-good one for this backbone:\n"
             f"  hf download lightx2v/Wan2.1-T2V-14B-StepDistill-CfgDistill-Lightx2v "
             f"loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors "
-            f"--local-dir ComfyUI/models/loras/lightx2v\n\n"
-            f"Or set distill_lora='none' to skip the merge."
+            f"--local-dir ComfyUI/models/loras/lightx2v"
         )
+    _warn_if_lora_looks_mismatched(lora_kind)
+
     from safetensors.torch import load_file as _load_safetensors
     from .lora_merge import merge_lora_into_base
 
-    logger.info("UniVidX: loading step-distill LoRA (%s) from %s", lora_kind, path)
+    logger.info("UniVidX: loading step-distill LoRA %r from %s", lora_kind, path)
     sd = _load_safetensors(path)
     try:
         report = merge_lora_into_base(
@@ -320,85 +350,500 @@ def _warn_attention_fallback(backend: str, head_dim: int, exc: BaseException) ->
     )
 
 
-def force_sage_over_fa2() -> bool:
-    """Replace DiffSynth's Wan DiT attention with a SageAttention-first
-    wrapper that falls back to FA2 (then SDPA) per-call.
+ATTENTION_BACKENDS = ("auto", "sdpa", "flash_attn_2", "sage")
 
-    Returns True if the wrapper was installed, False otherwise (e.g.
-    sageattention not installed, DiffSynth wan module not loadable).
+# UniVidX is a Wan2.1-T2V-14B fine-tune, so this is the only TeaCache
+# coefficient set that applies. Anything else raises in TeaCache.__init__.
+TEACACHE_MODEL_ID = "Wan2.1-T2V-14B"
+
+
+def pipeline_globals(model_instance) -> dict:
+    """The module namespace of the loaded pipeline class.
+
+    We cannot just `import src.pipelines.univid_intrinsic` at sampling
+    time: runtime._own_the_src_name() hands the top-level `src` name back
+    to whichever other custom node owns it the moment the import finishes,
+    so the module is no longer in sys.modules. The class object still
+    references its own globals, and that is where `TeaCache` and
+    `TemporalTiler_BCTHW` live (univid_intrinsic.py:10).
     """
     try:
-        import sageattention  # noqa: F401
+        return type(model_instance).__init__.__globals__
+    except AttributeError:
+        return {}
+
+
+def instrument_vae_encode(model_instance, *, tiled: bool,
+                          tile_size, tile_stride) -> bool:
+    """Time the conditioning VAE encode, and give it the tiling settings
+    upstream forgets to pass. Idempotent.
+
+    Two separate problems with `WanVideoVAE.encode`
+    (wan_video_vae.py:1218) as upstream calls it for conditioning:
+
+    1. The inference branch calls
+       `pipe.vae.encode(video, device=...)` with NO tiling arguments
+       (univid_intrinsic.py:913), so it takes the `tiled=False` default —
+       even though the training branch six hundred lines later
+       (:1173) passes `tiled=tile_size=tile_stride=` properly. The
+       sampler's `tiled` widget therefore reaches the DECODE but never
+       the conditioning ENCODE, and a full-frame encode at 880x1280 is
+       both slower and far heavier than a tiled one.
+
+    2. Its first statement is `videos = [video.to("cpu") for video in
+       videos]` — the batch is bounced to CPU and back regardless.
+
+    We wrap rather than patch upstream so the vendored tree stays clean.
+    The timer is always on: this sits in a stretch between "sampling
+    started" and the first progress tick that was ~9 minutes on a real
+    job with no visibility into where it went.
+    """
+    pipe = getattr(model_instance, "pipe", None)
+    vae = getattr(pipe, "vae", None) if pipe is not None else None
+    if vae is None or not hasattr(vae, "encode"):
+        return False
+    inner = vae.encode
+    if getattr(inner, "_bat_encode_wrapper", False):
+        return True
+
+    def encode(videos, device, **kwargs):
+        # Only fill in what the caller omitted — the training path passes
+        # its own and must keep it.
+        kwargs.setdefault("tiled", tiled)
+        kwargs.setdefault("tile_size", tile_size)
+        kwargs.setdefault("tile_stride", tile_stride)
+        t0 = time.perf_counter()
+        try:
+            return inner(videos, device, **kwargs)
+        finally:
+            logger.info(
+                "UniVidX: conditioning VAE encode took %.1f s (tiled=%s). "
+                "This runs before the first sampler step.",
+                time.perf_counter() - t0, kwargs["tiled"],
+            )
+
+    encode._bat_encode_wrapper = True
+    vae.encode = encode
+    return True
+
+
+def install_sliding_window_support(model_instance) -> bool:
+    """Make upstream's temporal tiler actually usable. Idempotent.
+
+    Two independent defects make the vendored sliding-window path
+    unrunnable as shipped:
+
+    1. `model_fn_wan_video` in univid_intrinsic.py:1220-1235 hand-builds
+       `model_kwargs` for the recursive call and OMITS `training_mode`
+       (plus cfg_merge and both gradient-checkpointing flags). A None
+       training_mode then falls off the end of the mode dispatch in
+       wan_video_dit_intrinsic.py:302-304, hits `print("wrong!!!!")` and
+       raises UnboundLocalError. univid_alpha.py:1162-1184 builds the
+       equivalent dict correctly, which is how we know this is an
+       oversight — the intrinsic window path has simply never been run.
+
+       We fix it by intercepting one level UP rather than re-copying
+       upstream's dict: pop the two window parameters and forward
+       everything else through untouched. Nothing can be omitted because
+       nothing is enumerated, so the next upstream parameter to appear is
+       carried automatically.
+
+    2. `TemporalTiler_BCTHW.build_1d_mask` (util.py:944) lacks the
+       `border_width == 0` guard the diffsynth original has. With
+       stride == size the ramp width is 0, `x[-0:]` selects the whole
+       tensor, and the assignment raises. Our planner never emits that,
+       but a subclass with the guard makes it a no-op instead of a crash.
+
+    Returns True if the patch is installed.
+    """
+    pipe = getattr(model_instance, "pipe", None)
+    if pipe is None:
+        logger.warning("UniVidX: no .pipe — cannot enable context windowing.")
+        return False
+
+    original = getattr(pipe, "model_fn", None)
+    if original is None:
+        logger.warning("UniVidX: pipe has no model_fn — cannot enable windowing.")
+        return False
+    if getattr(original, "_bat_window_patch", False):
+        return True
+
+    tiler_cls = pipeline_globals(model_instance).get("TemporalTiler_BCTHW")
+    if tiler_cls is None:
+        logger.warning(
+            "UniVidX: TemporalTiler_BCTHW not found in the pipeline "
+            "namespace — context windowing unavailable.",
+        )
+        return False
+
+    class _GuardedTiler(tiler_cls):
+        def build_1d_mask(self, length, left_bound, right_bound, border_width):
+            if border_width <= 0:
+                return torch.ones((length,))
+            return super().build_1d_mask(length, left_bound, right_bound,
+                                         border_width)
+
+    def model_fn(**kwargs):
+        size = kwargs.pop("sliding_window_size", None)
+        stride = kwargs.pop("sliding_window_stride", None)
+        latents = kwargs.get("latents")
+
+        if (not size or not stride or stride >= size
+                or latents is None or latents.dim() != 5
+                or latents.shape[2] <= size):
+            # Single pass. Note the window params are already popped, so
+            # upstream's own (broken) tiling branch can never trigger.
+            return original(**kwargs)
+
+        # tensor_names mirrors upstream: "latents" carries the four
+        # modality streams AND the injected conditioning rows, so slicing
+        # it windows the conditioning too. `run` drops names that are
+        # None, which is how y=None (T2V) is handled.
+        return _GuardedTiler().run(
+            original, int(size), int(stride),
+            latents.device, latents.dtype,
+            model_kwargs=kwargs,
+            tensor_names=["latents", "y"],
+        )
+
+    model_fn._bat_window_patch = True
+    pipe.model_fn = model_fn
+    logger.info(
+        "UniVidX: context-window support installed (upstream's tiler is "
+        "unrunnable as shipped; see install_sliding_window_support).",
+    )
+    return True
+
+
+def build_tea_cache(model_instance, *, num_inference_steps: int,
+                    rel_l1_thresh: float):
+    """Construct a TeaCache for this run, or None if unavailable.
+
+    TeaCache skips the whole 40-block DiT forward on steps where the
+    modulated timestep embedding has barely moved, adding a cached
+    residual instead (util.py:889-938). It is fully implemented upstream
+    but never wired: `WanVideoUnit_TeaCache` is absent from the pipeline's
+    `units` list, so `tea_cache` is always None and the two
+    `tea_cache_*` kwargs that __call__ pops are silently discarded.
+    Passing an instance directly through pipe(**kwargs) reaches
+    model_fn's `tea_cache` parameter, which is the shortest path in.
+
+    Two caveats the caller must respect:
+
+      * The instance is STATEFUL and single-use — build a fresh one per
+        sampler run, never cache it alongside the model.
+      * It must not be shared across a CFG pair. With cfg_scale != 1 the
+        pipeline calls model_fn twice per step (univid_intrinsic.py:670,
+        675); one shared instance would advance `self.step` twice and
+        blend the positive and negative residuals. The sampler refuses to
+        enable TeaCache in that case.
+
+    Accuracy caveat worth knowing: the polynomial coefficients were fit on
+    stock Wan2.1, and in conditioned modes some rows of `t_mod` are pinned
+    to a constant timestep, which dilutes the relative-L1 signal and biases
+    it toward skipping too eagerly. Start with a small threshold.
+    """
+    cls = pipeline_globals(model_instance).get("TeaCache")
+    if cls is None:
+        logger.warning(
+            "UniVidX: TeaCache class not found in the pipeline namespace; "
+            "caching disabled for this run.",
+        )
+        return None
+    try:
+        inst = cls(int(num_inference_steps), float(rel_l1_thresh),
+                   TEACACHE_MODEL_ID)
+    except Exception as exc:
+        logger.warning(
+            "UniVidX: could not construct TeaCache (%s: %s); "
+            "continuing without it.", type(exc).__name__, exc,
+        )
+        return None
+
+    # Count skips so the sampler can report the speedup that actually
+    # happened. The mapping from threshold to skip count is
+    # clip-dependent and, on this model, skewed by the pinned-timestep
+    # rows — so a measured number beats any documented estimate.
+    # `check()` returns True when the step is being skipped.
+    inst._bat_skipped = 0
+    inst._bat_checks = 0
+    _inner_check = inst.check
+
+    def _counting_check(dit, x, t_mod):
+        skipped = _inner_check(dit, x, t_mod)
+        inst._bat_checks += 1
+        if skipped:
+            inst._bat_skipped += 1
+        return skipped
+
+    inst.check = _counting_check
+    return inst
+
+
+def tea_cache_report(tea_cache) -> Optional[str]:
+    """One-line summary of what TeaCache actually did, or None.
+
+    Reports DiT passes saved rather than wall-clock: the skipped work is
+    the 40-block forward, while VAE encode/decode and text encoding are
+    unaffected, so end-to-end gain is always somewhat less than this.
+    """
+    if tea_cache is None:
+        return None
+    checks = getattr(tea_cache, "_bat_checks", 0)
+    skipped = getattr(tea_cache, "_bat_skipped", 0)
+    if not checks:
+        return None
+    computed = checks - skipped
+    ratio = (checks / computed) if computed else float("inf")
+    return (
+        f"TeaCache: computed {computed}/{checks} DiT passes "
+        f"(skipped {skipped}, {skipped / checks:.0%}) — "
+        f"{ratio:.2f}x fewer DiT passes. End-to-end gain is lower; VAE "
+        f"and text encoding don't skip."
+    )
+
+# Modules whose `flash_attention` folds K/V across the batch (the four
+# modality streams) vs. those that don't. See _make_folding_attention.
+_FOLDING_DIT_MODULES = (
+    "src.models.wan_video_dit_intrinsic",
+    "src.models.wan_video_dit_alpha",
+)
+_PLAIN_DIT_MODULES = ("src.models.wan_video_dit",)
+
+
+def _sage_kernel():
+    """SageAttention kernel over (B, N, S, D), or None if unavailable."""
+    try:
         from sageattention import sageattn
     except ImportError:
-        return False
-    try:
-        from diffsynth.models import wan_video_dit
-    except ImportError:
-        return False
-    if not getattr(wan_video_dit, "SAGE_ATTN_AVAILABLE", False):
-        return False
+        return None
 
+    def _k(q, k, v):
+        return sageattn(q, k, v, tensor_layout="HND")
+    return _k
+
+
+def _fa2_kernel():
+    """FlashAttention-2 kernel over (B, N, S, D), or None if unavailable.
+
+    FA2 wants (B, S, N, D); `.transpose(1, 2)` keeps the head_dim axis
+    contiguous, which is all it requires.
+    """
+    try:
+        from flash_attn import flash_attn_func
+    except ImportError:
+        return None
+
+    def _k(q, k, v):
+        out = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+        if isinstance(out, tuple):
+            out = out[0]
+        return out.transpose(1, 2)
+    return _k
+
+
+def _resolve_attention_chain(requested: str):
+    """Ordered [(name, kernel)] to try, best first. Unavailable backends
+    are dropped; SDPA is always the last resort and always present.
+
+    `auto` deliberately does NOT include SageAttention. Measured on an
+    RTX A5000 (sm_86) at the real Wan2.1-14B geometry (40 heads × 128 dim,
+    Q seqlen 1560, folded K/V seqlen 6240, bf16):
+
+        SDPA          14.4 ms      (reference)
+        FA2           13.9 ms      rel err 0.25%
+        Sage          16.7 ms      rel err 1.99%   <- slower AND less exact
+
+    Sage's int8 quantisation costs more than it saves at this shape on
+    sm_86, and this env has no `_qattn_sm90.so` anyway. It stays selectable
+    because the farm card is a different architecture and may invert that
+    result — but it has to be chosen deliberately, not inherited.
+
+    Worth knowing before expecting much from any of these: torch's SDPA is
+    already a fused FlashAttention kernel, not naive attention. Forcing
+    SDPBackend.MATH on the same shape takes 152 ms — 13× slower — which is
+    what "unoptimised" would actually look like. So switching backends is
+    a few percent, not a multiple.
+    """
+    sage, fa2 = _sage_kernel(), _fa2_kernel()
+    if requested == "sdpa":
+        candidates = []
+    elif requested == "flash_attn_2":
+        candidates = [("flash_attn_2", fa2)]
+    elif requested == "sage":
+        candidates = [("sage", sage), ("flash_attn_2", fa2)]
+    else:  # "auto" — FA2 first, no sage
+        candidates = [("flash_attn_2", fa2)]
+    chain = [(n, k) for n, k in candidates if k is not None]
+    chain.append(("sdpa", None))  # None == use F.scaled_dot_product_attention
+    return chain
+
+
+def _attend(q, k, v, chain, head_dim):
+    """Run attention on (B, N, S, D) tensors, walking `chain` until one
+    succeeds. Warn-once per (backend, head_dim, exc-type)."""
     import torch.nn.functional as F
+
+    # FA2/Sage are half-precision only; anything else goes straight to SDPA.
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        return F.scaled_dot_product_attention(q, k, v)
+
+    for name, kernel in chain:
+        if kernel is None:
+            break
+        try:
+            return kernel(q, k, v)
+        except Exception as exc:
+            _warn_attention_fallback(name, head_dim, exc)
+    return F.scaled_dot_product_attention(q, k, v)
+
+
+def _make_folding_attention(chain):
+    """Build a `flash_attention` replacement for the intrinsic/alpha DiTs.
+
+    These two modules use `drop_out` as a BRANCH SELECTOR, not a
+    probability, and getting that wrong silently destroys the model:
+
+      * `SelfAttention.forward` hard-sets `drop_out = 0`
+        (wan_video_dit_intrinsic.py:147), so `torch.rand(1) < 0` is always
+        False and the folded branch runs: K/V are reshaped to
+        `1 n (b s) d` and repeated, i.e. every modality stream attends
+        over ALL FOUR streams concatenated. That fold *is* UniVidX's
+        cross-modal attention (CMSA) — there is no other mechanism.
+      * `CrossAttention.forward` defaults `drop_out = 1`
+        (:328), so `torch.rand(1) < 1` is always True and the per-stream
+        branch runs — correct, since each stream attends its own text.
+
+    So we reproduce the branch exactly and swap only the kernel. A naive
+    dispatcher that always does `b n s d` for K/V (like the old
+    force_sage_over_fa2 did) would remove cross-modal attention entirely
+    and still produce plausible-looking output.
+
+    `drop_out=None` (the unreachable `k_img` call at :341, which would
+    TypeError upstream) is treated as 0 → folded. Harmless either way:
+    the image context is identical across the four streams, so softmax
+    over four copies of it returns the same result.
+    """
     from einops import rearrange
 
-    # Capture FA2 reference if present so we can use it as the fallback.
-    _FA2 = None
-    if getattr(wan_video_dit, "FLASH_ATTN_2_AVAILABLE", False):
-        try:
-            import flash_attn
-            _FA2 = flash_attn.flash_attn_func
-        except ImportError:
-            _FA2 = None
-
-    def _wrapped_flash_attention(q, k, v, num_heads, compatibility_mode=False,
-                                  drop_out=None, **_kwargs):
+    def flash_attention(q, k, v, num_heads, compatibility_mode=False,
+                        drop_out=None, **_kwargs):
+        b = q.shape[0]
         head_dim = q.shape[-1] // num_heads
+        per_stream = (drop_out is not None) and bool(torch.rand(1) < drop_out)
 
-        if compatibility_mode or head_dim > 256:
-            q2 = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+        q2 = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+        if per_stream:
             k2 = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
             v2 = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-            x = F.scaled_dot_product_attention(q2, k2, v2)
-            return rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+        else:
+            # `.expand` rather than upstream's `.repeat`. All b rows of the
+            # folded K/V are the SAME tensor, so materialising b copies is
+            # pure waste. Measured at Wan2.1-14B geometry (40h x 128d,
+            # S=1560, B=4, bf16) on sm_86:
+            #     repeat  732.7 MiB peak, 21.7 ms
+            #     expand  305.6 MiB peak, 12.2 ms   (-58% mem, 1.8x faster)
+            # with bit-identical output (torch.equal). This is the single
+            # biggest per-call win available here, and it compounds over
+            # 40 blocks x N steps.
+            k2 = rearrange(k, "b s (n d) -> 1 n (b s) d", n=num_heads).expand(b, -1, -1, -1)
+            v2 = rearrange(v, "b s (n d) -> 1 n (b s) d", n=num_heads).expand(b, -1, -1, -1)
 
-        try:
-            q2 = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-            k2 = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-            v2 = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-            x = sageattn(q2, k2, v2)
-            return rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-        except Exception as exc:
-            _warn_attention_fallback("sage", head_dim, exc)
+        use = [("sdpa", None)] if compatibility_mode else chain
+        x = _attend(q2, k2, v2, use, head_dim)
+        return rearrange(x, "b n s d -> b s (n d)", n=num_heads)
 
-        if _FA2 is not None:
-            try:
-                q2 = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
-                k2 = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
-                v2 = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
-                x = _FA2(q2, k2, v2)
-                return rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-            except Exception as exc:
-                _warn_attention_fallback("FA2", head_dim, exc)
+    return flash_attention
 
+
+def _make_plain_attention(chain):
+    """Build a `flash_attention` replacement for the base vendored DiT,
+    which takes no `drop_out` and never folds across the batch."""
+    from einops import rearrange
+
+    def flash_attention(q, k, v, num_heads, compatibility_mode=False, **_kwargs):
+        head_dim = q.shape[-1] // num_heads
         q2 = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k2 = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v2 = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q2, k2, v2)
+        use = [("sdpa", None)] if compatibility_mode else chain
+        x = _attend(q2, k2, v2, use, head_dim)
         return rearrange(x, "b n s d -> b s (n d)", n=num_heads)
 
-    wan_video_dit.flash_attention = _wrapped_flash_attention
+    return flash_attention
 
-    # Also patch UniVidX's vendored base wan_video_dit module — see
-    # the original's comments for why we patch only the BASE variant
-    # and leave the per-variant CMSA modules on native SDPA.
+
+def install_attention_backend(requested: str = "auto") -> str:
+    """Replace UniVidX's hardcoded-SDPA attention with a real dispatcher.
+
+    Upstream's `get_optimal_attention_mode()`
+    (wan_video_dit_intrinsic.py:10-21) is a stub: every branch, including
+    the `except`, returns "scaled_dot_product", and `FLASH_ATTN_3_AVAILABLE`
+    is hardcoded False inside a `try` that cannot fail. All three branches
+    of `flash_attention` therefore end in F.scaled_dot_product_attention.
+    Since UniVidX folds four modality streams into one length-4S sequence,
+    attention cost scales as 16·n·S² — so this is the hottest code in the
+    model, pinned to the slowest backend.
+
+    MUST be called AFTER the pipeline class has been imported: we patch
+    module globals via sys.modules, and `src.models.wan_video_dit_intrinsic`
+    only exists once `src.pipelines.univid_intrinsic` has been imported.
+    (The previous `force_sage_over_fa2` ran before the import, so its
+    vendored-module patch silently hit nothing.)
+
+    Returns the resolved backend name actually installed.
+    """
     import sys as _sys
-    for mod_name in ("src.models.wan_video_dit",):
+
+    if requested not in ATTENTION_BACKENDS:
+        logger.warning(
+            "UniVidX: unknown attention_backend %r, falling back to 'auto'.",
+            requested,
+        )
+        requested = "auto"
+
+    chain = _resolve_attention_chain(requested)
+    resolved = chain[0][0]
+
+    if requested != "auto" and resolved != requested:
+        logger.warning(
+            "UniVidX: attention_backend=%r requested but unavailable; "
+            "using %r instead.", requested, resolved,
+        )
+
+    patched = []
+    for mod_name, factory in (
+        *((m, _make_folding_attention) for m in _FOLDING_DIT_MODULES),
+        *((m, _make_plain_attention) for m in _PLAIN_DIT_MODULES),
+    ):
         mod = _sys.modules.get(mod_name)
         if mod is None or not hasattr(mod, "flash_attention"):
             continue
-        mod.flash_attention = _wrapped_flash_attention
-    return True
+        mod.flash_attention = factory(chain)
+        patched.append(mod_name.rsplit(".", 1)[-1])
+
+    # DiffSynth's own Wan DiT (used by the VAE/text-encoder side) has the
+    # same signature as the base vendored module.
+    try:
+        from diffsynth.models import wan_video_dit as _ds_dit
+        if hasattr(_ds_dit, "flash_attention"):
+            _ds_dit.flash_attention = _make_plain_attention(chain)
+            patched.append("diffsynth.wan_video_dit")
+    except ImportError:
+        pass
+
+    if not patched:
+        logger.warning(
+            "UniVidX: attention backend %r resolved but no DiT module was "
+            "patched — the model may not be imported yet. Attention stays "
+            "on stock SDPA.", resolved,
+        )
+    else:
+        logger.info(
+            "UniVidX: attention backend = %s (patched: %s)",
+            resolved, ", ".join(patched),
+        )
+    return resolved
 
 
 # ─── Runtime FP8 quantize via mmgp/optimum-quanto ──────────────────────────
