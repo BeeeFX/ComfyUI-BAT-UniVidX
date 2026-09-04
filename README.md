@@ -34,7 +34,7 @@ cd ComfyUI-BAT-UniVidXWrapper
 pip install -r requirements.txt
 ```
 
-Start ComfyUI. The nodes are under **🦇 BAT/UniVidX**.
+Start ComfyUI. The nodes are under **BAT/UniVidX**.
 
 First run downloads the Wan2.1-T2V-14B backbone (~57 GB) and the UniVidX checkpoint (~0.8 GB) unless you already have them — it checks `ComfyUI/models/` first and reuses what it finds. Needs a recent ComfyUI (V3 node schema) and `comfyui-frontend-package` **1.45.x or newer**.
 

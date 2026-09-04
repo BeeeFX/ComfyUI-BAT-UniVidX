@@ -291,7 +291,7 @@ class BatUniVidXLoader:
     RETURN_TYPES = ("UNIVIDX_MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "load"
-    CATEGORY = "🦇 BAT/UniVidX"
+    CATEGORY = "BAT/UniVidX"
 
     def load(
         self,
@@ -678,7 +678,7 @@ class BatUniVidXSample(io.ComfyNode):
         return io.Schema(
             node_id="BAT_UniVidXSample",
             display_name="🦇 UniVidX Sample",
-            category="🦇 BAT/UniVidX",
+            category="BAT/UniVidX",
             description=(
                 "Run UniVidX in any of its 30 modes. The mode dropdown "
                 "reshapes the node: only the IMAGE sockets that mode "
@@ -1086,7 +1086,7 @@ class BatUniVidXDecode(io.ComfyNode):
         return io.Schema(
             node_id="BAT_UniVidXDecode",
             display_name="🦇 UniVidX Decode",
-            category="🦇 BAT/UniVidX",
+            category="BAT/UniVidX",
             description=(
                 "Splay a UniVidX result into its 4 image streams. Slot "
                 "names cover both families: intrinsic outputs are "
@@ -1412,7 +1412,7 @@ class BatUniVidXCacheOptions:
     RETURN_TYPES = ("UNIVIDX_CACHE_OPTIONS",)
     RETURN_NAMES = ("cache_options",)
     FUNCTION = "build"
-    CATEGORY = "🦇 BAT/UniVidX"
+    CATEGORY = "BAT/UniVidX"
     DESCRIPTION = (
         "TeaCache for UniVidX: skip the DiT forward on steps where little "
         "changes and reuse the previous residual. Typically 1.4-1.9x, at "
@@ -1459,7 +1459,7 @@ class BatUniVidXContextOptions:
     RETURN_TYPES = ("UNIVIDX_CONTEXT_OPTIONS",)
     RETURN_NAMES = ("context_options",)
     FUNCTION = "build"
-    CATEGORY = "🦇 BAT/UniVidX"
+    CATEGORY = "BAT/UniVidX"
     DESCRIPTION = (
         "Sample long clips in overlapping temporal windows, blended inside "
         "the denoising loop, to get past the ~81-frame single-pass limit. "
