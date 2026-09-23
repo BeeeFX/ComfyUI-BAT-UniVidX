@@ -21,7 +21,13 @@ UniVidX/checkpoints/
 
 # Local model cache (lives under ComfyUI/models/unividx/ anyway, but if
 # anyone symlinks it here, don't track the weights).
-models/
+#
+# Anchored with a leading slash on purpose. An unanchored `models/`
+# matches a directory of that name at ANY depth, and silently kept
+# upstream's source package UniVidX/src/models/ (the DiT, VAE, T5 and
+# ModelManager code) out of the vendored copy. After re-vendoring, run
+# `git status --ignored UniVidX/` and check nothing under src/ is listed.
+/models/
 *.pt
 *.safetensors
 *.bin

@@ -52,3 +52,14 @@ Then update `UNIVIDX_PINNED_COMMIT` in
 `unividx_wrapper_runtime/auto_clone.py` to match, and re-check the
 runtime patches in `advanced.py` still apply — they target specific
 upstream functions by name.
+
+Before committing, make sure no upstream source is being ignored:
+
+```bash
+git status --short --ignored UniVidX/
+```
+
+Nothing under `UniVidX/src/` may show as `!!` (ignored). An unanchored
+`models/` pattern in the wrapper's `.gitignore` once kept all of
+`src/models/` — the DiT, VAE and text-encoder code — out of this copy,
+and nothing failed until a fresh checkout tried to import it.
