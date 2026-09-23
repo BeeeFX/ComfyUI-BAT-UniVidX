@@ -101,6 +101,12 @@ Worth turning on, in order of payoff:
 
 FP8 and block swapping work together — quantised layers stay fp8 in every state *and* keep streaming, so the resident copy is 1 byte per parameter. (They used to be mutually exclusive; quantisation replaced the wrappers that did the streaming.)
 
+**Loading uses no VRAM.** The model loads straight into system RAM, with the DiT streamed in one shard at a time, and layers move onto the GPU only when sampling starts, within the `vram_buffer_gb` budget. So a card too small to *hold* the model can still load it; what has to fit is the sampler's working set. Rough system-RAM needs (estimates, not measurements): ~45 GB free while loading, ~26 GB while loaded with FP8 (~40 GB with `fp8_quantize: none`).
+
+**The GPU is handed back after every run.** Results move to CPU and the model is offloaded to RAM once the Sample node finishes, so the rest of your graph gets the card.
+
+**ComfyUI's memory buttons reach this model.** *Unload models* moves it off the GPU but keeps it in RAM (the next run resumes in seconds). *Free model and node cache* releases it from RAM entirely (the next run reloads).
+
 **Long clips**: peak VRAM is set by the **window**, not the clip. A 300-frame render in 81-frame windows costs the same per pass as an 81-frame one — it just does more passes. If you OOM, lower `context_frames`; if it's slow, that's the window count.
 
 Every setting has fuller guidance behind the **?** on its node, including measured numbers.
@@ -112,6 +118,7 @@ Every setting has fuller guidance behind the **?** on its node, including measur
 - **Tensor size mismatch while sampling** — TeaCache combined with windowing. It should now refuse that and say so; if you see it, the guard was bypassed.
 - **`the upstream copy at … is incomplete`** — files are missing from `./UniVidX/`, usually a partial checkout or a deploy that didn't copy everything. `git checkout -- UniVidX` in the pack directory restores it.
 - **`No module named 'src.pipelines'`** — another custom node has claimed the top-level `src` name (several do). The wrapper rebinds it and logs when it does; if it still fails, see the previous item.
+- **Out of system RAM while loading** — loading holds the finished bf16 DiT, the T5 encoder and one checkpoint shard at once (roughly 45 GB). Close other RAM-heavy processes, or press *Free model and node cache* to release whatever ComfyUI is holding.
 - **First run takes a long time** — model load plus any first-time download. Later runs reuse everything.
 
 ---

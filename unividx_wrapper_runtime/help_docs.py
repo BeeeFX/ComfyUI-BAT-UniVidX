@@ -300,6 +300,27 @@ state — so the GPU-resident copy is 1 byte per parameter too, not just the
 offloaded one. Numerics are unchanged from the old FP8 path (measured
 identical), and biases and LoRA adapters stay bf16.
 
+### Where the model lives, and the memory buttons
+
+Loading uses **no VRAM**. The model loads straight into system RAM, with
+the DiT built empty and filled one checkpoint shard at a time, and layers
+move to the GPU only when sampling starts, within the budget above.
+(Upstream's own loader put the ~28 GB DiT and ~11 GB text encoder on the
+GPU first, so a 24-32 GB card failed before sampling could even begin.)
+Rough system-RAM needs (estimates): ~45 GB free while loading, ~26 GB
+while loaded with FP8, ~40 GB without.
+
+After every run the Sample node moves its results to the CPU and offloads
+the model to RAM, so the GPU is free for the rest of the graph.
+
+ComfyUI's own buttons reach the model:
+
+- **Unload models** — moves it off the GPU, keeps it in RAM. The next run
+  resumes in seconds. (ComfyUI also does this by itself after an
+  out-of-memory error.)
+- **Free model and node cache** — releases it from RAM entirely. The next
+  run reloads it.
+
 ## What's on by default
 
 Three things are **on by default**, and none of them changes output
