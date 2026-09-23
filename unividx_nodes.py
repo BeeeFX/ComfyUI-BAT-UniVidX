@@ -1,14 +1,14 @@
 """ComfyUI node classes for the BAT UniVidX wrapper.
 
-Three nodes:
-  BAT_UniVidXLoader   — picks variant + dtype + weight sources;
-                        on first execute, auto-clones upstream UniVidX
-                        and auto-resolves Wan2.1 + UniVidX checkpoint
-                        paths (downloading from HF if not on disk).
-                        Returns an opaque UNIVIDX_MODEL.
+Three core nodes (plus two optional options nodes at the bottom):
+  BAT_UniVidXLoader   — picks variant + weight sources; checks the
+                        vendored upstream UniVidX and auto-resolves
+                        Wan2.1 + UniVidX checkpoint paths (downloading
+                        from HF if not on disk). Returns an opaque
+                        UNIVIDX_MODEL.
 
-  BAT_UniVidXSample   — single dynamic-schema sampler, and the only
-                        V3 (io.ComfyNode) node in this pack. The mode
+  BAT_UniVidXSample   — single dynamic-schema sampler, V3
+                        (io.ComfyNode). The mode
                         dropdown is an io.DynamicCombo: each mode is an
                         Option declaring exactly the IMAGE sockets that
                         mode consumes, so only those are materialised
@@ -20,16 +20,17 @@ Three nodes:
   BAT_UniVidXDecode   — single decode node, also V3. Branches on the
                         result's family internally, returns 4 IMAGE
                         outputs in canonical order — black placeholders
-                        fill any slot the mode didn't produce. The output
-                        COUNT is fixed at 4 because ComfyUI has no
-                        dynamic-output mechanism; see the class docstring.
+                        fill any slot the mode didn't produce — plus the
+                        matte as a MASK. The output COUNT is fixed
+                        because ComfyUI has no dynamic-output mechanism;
+                        see the class docstring.
 """
 from __future__ import annotations
 
 import logging
 import os
 import time
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 
@@ -49,8 +50,8 @@ from .unividx_wrapper_runtime import (
 
 logger = logging.getLogger("ComfyUI-BAT-UniVidXWrapper")
 
-# Wrapper directory (where this file lives). Upstream UniVidX will
-# auto-clone into <wrapper_dir>/UniVidX/ on first use.
+# Wrapper directory (where this file lives). Upstream UniVidX is vendored
+# in <wrapper_dir>/UniVidX/.
 _WRAPPER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Opaque wrapper datatypes. `io.Custom` emits the same wire-level type
@@ -99,10 +100,10 @@ class BatUniVidXLoader:
                     {
                         "default": "bf16",
                         "tooltip": (
-                            "Model working dtype. bf16 is what UniVidX was "
-                            "trained at and what every benchmark assumes; fp16 "
-                            "saves nothing on Ampere+ but may be needed on "
-                            "older cards. Stick with bf16 unless you know why."
+                            "Leave on bf16. UniVidX's pipeline is hardcoded "
+                            "to bf16 upstream, so fp16 has no effect — it is "
+                            "accepted (and logged as ignored) only so older "
+                            "saved workflows keep loading."
                         ),
                     },
                 ),
@@ -246,13 +247,13 @@ class BatUniVidXLoader:
                     "BOOLEAN",
                     {"default": False,
                      "tooltip": (
-                         "torch.compile(dit, mode='reduce-overhead', "
-                         "dynamic=True). First sampler step pays a "
-                         "60-120 sec graph capture cost; subsequent "
-                         "steps are ~20-30% faster on Blackwell/Ada. "
-                         "The compile cache is keyed by tensor shapes — "
-                         "changing resolution or frame count between "
-                         "runs forces a recompile."
+                         "torch.compile each of the DiT's 40 transformer "
+                         "blocks (dynamic shapes). The first sampler step "
+                         "pays the compile cost — minutes, not seconds, "
+                         "for a 14B model — so it only pays off on long "
+                         "or repeated renders. The speedup on this model "
+                         "is unmeasured: compare wall-clock and keep it if "
+                         "it earns its place."
                      )},
                 ),
                 # NOTE: this replaced a BOOLEAN `prefer_sage_attn` in the
@@ -282,7 +283,10 @@ class BatUniVidXLoader:
                          "here to be measured).\n\n"
                          "All backends agree with SDPA to <2% on the "
                          "cross-modality attention. A VISIBLE difference is "
-                         "a bug, not a tradeoff. Resolved backend is logged."
+                         "a bug, not a tradeoff. Resolved backend is logged.\n\n"
+                         "Every backend, sdpa included, also gets the "
+                         "wrapper's leaner cross-modal K/V fold (~58% less "
+                         "attention scratch memory than upstream's)."
                      )},
                 ),
             },
@@ -310,7 +314,7 @@ class BatUniVidXLoader:
         # one. runtime._coerce_attention_backend handles the bool form.
         attention_backend="auto",
     ):
-        # Stage 1: ensure upstream UniVidX is cloned + patched.
+        # Stage 1: verify the vendored upstream UniVidX tree.
         upstream_dir = auto_clone.auto_clone(_WRAPPER_DIR)
 
         # Stage 2: resolve weight paths. "auto-detect, fall back to
@@ -607,14 +611,23 @@ def _mode_options() -> list:
         if required:
             # denoising_strength is only meaningful when there's an IMAGE
             # conditioning input to preserve.
+            #
+            # Kept for saved-workflow compatibility (widget values restore
+            # by position), but it is NOT an img2img strength: the wired
+            # images are conditioning, applied in full at any value. The
+            # outputs always start from pure noise, so a value below 1.0
+            # only starts the schedule at a lower noise level than the
+            # latents actually carry — leaving them under-denoised.
             inputs.append(
                 io.Float.Input(
                     "denoising_strength", default=1.0, min=0.0, max=1.0, step=0.01,
                     tooltip=(
-                        "How much of the wired input to preserve. 1.0 = "
-                        "ignore the input spatially (use only as "
-                        "text-prompt guidance); <1.0 = preserve more of "
-                        "the input."
+                        "Leave at 1.0. This is not an img2img strength: "
+                        "the wired images always condition the result in "
+                        "full. UniVidX generates its outputs from pure "
+                        "noise, so values below 1.0 just stop denoising "
+                        "early and leave visible noise. Upstream always "
+                        "uses 1.0."
                     ),
                 )
             )
@@ -718,11 +731,19 @@ class BatUniVidXSample(io.ComfyNode):
                 # `optional_prompt` toggle.
                 io.Int.Input(
                     "num_inference_steps", default=20, min=1, max=100, step=1,
-                    tooltip="Denoising steps. UniVidX was trained at 20. "
-                            ">30 rarely helps.",
+                    tooltip="Denoising steps. Upstream's own inference "
+                            "scripts use 50; 20 is this node's speed/"
+                            "quality default. With a step-distill LoRA on "
+                            "the loader, use 4.",
                 ),
+                # `fixed` rather than the frontend's default `randomize`
+                # for widgets named "seed": with randomize, re-queueing
+                # after touching ANY downstream node changes the seed and
+                # forces a full multi-hour re-render instead of reusing
+                # ComfyUI's cached result.
                 io.Int.Input(
                     "seed", default=1, min=0, max=0xFFFFFFFF,
+                    control_after_generate=io.ControlAfterGenerate.fixed,
                     tooltip="Random seed for noise initialisation.",
                 ),
                 io.Boolean.Input(
@@ -875,52 +896,70 @@ class BatUniVidXSample(io.ComfyNode):
         #   Text-only modes — nothing to measure, so the mode's own
         #     num_frames/height/width widgets supply it.
         #
-        # H/W are snapped up to a multiple of 16 either way: UniVidX's
-        # preprocessor rounds internally but one downstream path uses the
-        # un-rounded value, producing a silent shape mismatch (same bug
-        # class the DKT wrapper hit).
+        # H/W must be a multiple of 16: UniVidX's preprocessor rounds
+        # internally but one downstream path uses the un-rounded value,
+        # producing a silent shape mismatch (same bug class the DKT wrapper
+        # hit). Image inputs are edge-PADDED up to it rather than stretched,
+        # and Decode crops the padding off again, so outputs come back at
+        # exactly the input's resolution and pixel-aligned with the plate.
+        # (Stretching 1080 -> 1088 used to hand back 1088-line outputs
+        # that no longer lined up with the source.)
         n_original = None
+        content_hw = None
         if required:
             ref = supplied_imgs[required[0]]
-            ref_padded, n_original = frame_constraints.pad_to_wan_frame_count(ref)
-            target_frames = ref_padded.shape[0]
-            target_h = frame_constraints.snap_to_16(ref.shape[1])
-            target_w = frame_constraints.snap_to_16(ref.shape[2])
+            n_in = ref.shape[0]
+            target_frames = frame_constraints.wan_frame_count(n_in)
+            n_original = n_in
+            content_hw = (int(ref.shape[1]), int(ref.shape[2]))
+            target_h = frame_constraints.snap_to_16(content_hw[0])
+            target_w = frame_constraints.snap_to_16(content_hw[1])
             logger.info(
-                "UniVidX_Sample: geometry from wired %r: %d frames @ %dx%d "
-                "(snapped from %dx%d).",
-                required[0], target_frames, target_h, target_w,
-                ref.shape[1], ref.shape[2],
+                "UniVidX_Sample: geometry from wired %r: %d frames%s @ "
+                "%dx%d%s.",
+                required[0], n_in,
+                f" (padded to {target_frames})" if target_frames != n_in else "",
+                content_hw[0], content_hw[1],
+                f" (padded to {target_h}x{target_w})"
+                if (target_h, target_w) != content_hw else "",
             )
         else:
             target_frames = int(mode["num_frames"])
             target_h = frame_constraints.snap_to_16(mode["height"])
             target_w = frame_constraints.snap_to_16(mode["width"])
 
-        # Build per-modality conditioning tensors in UniVidX's shape.
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.bfloat16
+        if float(denoising_strength) < 1.0:
+            logger.warning(
+                "UniVidX_Sample: denoising_strength=%.2f < 1.0. The outputs "
+                "start from pure noise, so this ends denoising early and "
+                "leaves residual noise — it does not preserve the input. "
+                "Set it to 1.0 unless that is what you want.",
+                float(denoising_strength),
+            )
+
+        # Build per-modality conditioning tensors in UniVidX's shape. They
+        # stay on the CPU: upstream moves each one to the GPU for its VAE
+        # encode, while a copy placed there now would stay referenced in
+        # pipe()'s kwargs — and resident in VRAM — for the entire denoising
+        # loop (several GB per input on a long 1080p clip).
+        dtype = getattr(getattr(model_instance, "pipe", None), "torch_dtype",
+                        torch.bfloat16)
         inference_videos: dict[str, Optional[torch.Tensor]] = {}
         for key in modes.family_input_order(family):
             img = supplied_imgs.get(key)
             if img is None:
                 inference_videos[f"inference_{key}"] = None
                 continue
-            if n_original is not None:
-                img_padded, _ = frame_constraints.pad_to_wan_frame_count(img)
-            else:
-                img_padded = img
             inference_videos[f"inference_{key}"] = tensor_io.image_batch_to_video_tensor(
-                img_padded,
+                img,
+                content_height=content_hw[0],
+                content_width=content_hw[1],
                 target_height=target_h,
                 target_width=target_w,
                 target_frames=target_frames,
-                device=device,
+                device="cpu",
                 dtype=dtype,
             )
-
-        pbar = comfy.utils.ProgressBar(3)
-        pbar.update_absolute(0, 3)
 
         # The upstream pipe wants the prompt replicated 4x (one per
         # modality stream of the family). The existing wrapper does
@@ -1023,9 +1062,14 @@ class BatUniVidXSample(io.ComfyNode):
             tile_size=_UPSTREAM_TILE_SIZE, tile_stride=_UPSTREAM_TILE_STRIDE,
         )
 
-        pbar.update_absolute(1, 3)
+        # The progress bar counts denoising steps — the part that takes
+        # hours — reported live from inside pipe(), which also checks for
+        # Cancel before every step (and every context window).
+        runtime.free_comfy_vram()
+        pbar = comfy.utils.ProgressBar(int(num_inference_steps))
         _t_pipe = time.perf_counter()
-        with runtime.unividx_cwd(upstream_dir):
+        with runtime.unividx_cwd(upstream_dir), \
+                runtime.sampler_progress(lambda: pbar.update(1)):
             with torch.inference_mode():
                 result_dict = model_instance.pipe(**pipe_args)
         logger.info(
@@ -1033,7 +1077,6 @@ class BatUniVidXSample(io.ComfyNode):
             "prompt encode + model swaps + %d sampler steps + VAE decode).",
             time.perf_counter() - _t_pipe, int(num_inference_steps),
         )
-        pbar.update_absolute(2, 3)
 
         # Report what caching actually saved. The threshold -> skip-count
         # mapping is clip-dependent, so the measured number is worth more
@@ -1048,8 +1091,8 @@ class BatUniVidXSample(io.ComfyNode):
             "mode": mode_name,
             "family": family,
             "n_original": n_original,  # for the decoder to trim back
+            "content_hw": content_hw,  # for the decoder to crop back
         }
-        pbar.update_absolute(3, 3)
         return io.NodeOutput(result)
 
 
@@ -1057,7 +1100,8 @@ class BatUniVidXSample(io.ComfyNode):
 
 
 class BatUniVidXDecode(io.ComfyNode):
-    """Splay the opaque UNIVIDX_RESULT into 4 IMAGE outputs.
+    """Splay the opaque UNIVIDX_RESULT into 4 IMAGE outputs, plus the
+    matte as a MASK.
 
     Branches on the family. For intrinsic, the outputs are (rgb,
     albedo, irradiance, normal); for alpha they're (rgb, pha, fgr,
@@ -1125,6 +1169,16 @@ class BatUniVidXDecode(io.ComfyNode):
                             "Alpha: background.\n"
                             "Black if this mode didn't produce it.",
                 ),
+                # Appended LAST so links saved against the four IMAGE
+                # slots above keep their indices.
+                io.Mask.Output(
+                    "pha_mask", display_name="matte (mask)",
+                    tooltip="Alpha: the predicted matte as a MASK, ready "
+                            "for compositing / masking nodes without an "
+                            "image-to-mask conversion.\n"
+                            "Empty for intrinsic modes and for alpha modes "
+                            "that take the matte as an input.",
+                ),
             ],
         )
 
@@ -1140,40 +1194,43 @@ class BatUniVidXDecode(io.ComfyNode):
             else ["rgb", "pha", "fgr", "bgr"]
         )
 
-        # First, determine the canonical (T, H, W, 3) shape from any
-        # tensor we can find in the result dict, so we know what shape
-        # placeholder tensors should take.
-        any_tensor = None
-        for v in pipe_result.values():
-            if v is not None:
-                any_tensor = v
-                break
-        if any_tensor is None:
+        # Undo the Sample node's padding: trim frames back to the count fed
+        # in, crop H/W back to the input's size.
+        content_h, content_w = result.get("content_hw") or (None, None)
+        produced = {
+            slot: tensor_io.pipe_result_frame_to_image(
+                pipe_result[slot], frames=n_original,
+                height=content_h, width=content_w,
+            )
+            for slot in slot_keys if pipe_result.get(slot) is not None
+        }
+        if not produced:
             raise RuntimeError(
                 "UniVidX_Decode: pipe returned no usable tensors. "
                 "Check the wrapper console for upstream errors."
             )
-        reference = tensor_io.pipe_result_frame_to_image(any_tensor)
-        ref_t, ref_h, ref_w = reference.shape[0], reference.shape[1], reference.shape[2]
+        # Placeholders take their shape from a real output, after trimming.
+        ref_t, ref_h, ref_w = next(iter(produced.values())).shape[:3]
 
-        # Trim every slot — real tensors and placeholders alike — so all
-        # four outputs share the frame count the user fed in.
         outputs = []
         placeholders = []
         for slot in slot_keys:
-            t = pipe_result.get(slot)
-            if t is None:
-                converted = tensor_io.black_placeholder(ref_t, ref_h, ref_w)
-                placeholders.append(slot)
+            if slot in produced:
+                outputs.append(produced[slot])
             else:
-                converted = tensor_io.pipe_result_frame_to_image(t)
-            if n_original is not None:
-                converted = frame_constraints.trim_to_original(converted, n_original)
-            outputs.append(converted)
+                outputs.append(tensor_io.black_placeholder(ref_t, ref_h, ref_w))
+                placeholders.append(slot)
+
+        # MASK slot: the matte, averaged over the three near-identical grey
+        # channels the VAE decodes it as.
+        if "pha" in produced:
+            outputs.append(produced["pha"].mean(dim=-1))
+        else:
+            outputs.append(tensor_io.black_mask(ref_t, ref_h, ref_w))
 
         logger.info(
             "UniVidX_Decode: mode=%s, family=%s, outputs=4×(%d,%d,%d,3)",
-            mode, family, outputs[0].shape[0], outputs[0].shape[1], outputs[0].shape[2],
+            mode, family, ref_t, ref_h, ref_w,
         )
         # Name the black slots explicitly — otherwise a user wiring a
         # slot this mode never produces just sees black frames with no
@@ -1276,18 +1333,12 @@ def _count_context_windows(target_frames: int, size_lat: int,
                            stride_lat: int) -> int:
     """How many passes the tiler will actually make.
 
-    Mirrors TemporalTiler_BCTHW.run's loop exactly (util.py:967-969),
-    including its skip of a window the previous one already covered,
-    rather than estimating with a ceiling division — an estimate here
-    once reported 9 windows for a job that ran 2.
+    Uses the tiler's own window planner rather than estimating with a
+    ceiling division — an estimate here once reported 9 windows for a job
+    that ran 2.
     """
     total_lat = _pixel_to_latent_frames(target_frames)
-    n = 0
-    for t in range(0, total_lat, stride_lat):
-        if t - stride_lat >= 0 and t - stride_lat + size_lat >= total_lat:
-            continue
-        n += 1
-    return n
+    return len(runtime.context_window_starts(total_lat, size_lat, stride_lat))
 
 
 def _resolve_cache_plan(cache_options, *, windowing: bool, cfg_scale: float,
