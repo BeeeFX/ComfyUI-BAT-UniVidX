@@ -117,9 +117,9 @@ def _own_the_src_name(upstream_dir: str):
     init_py = os.path.join(src_dir, "__init__.py")
     if not os.path.isfile(init_py):
         raise RuntimeError(
-            f"UniVidX: expected {init_py} to exist (auto_clone creates it). "
-            "The upstream clone looks incomplete — delete "
-            f"{upstream_dir!r} and re-run to force a fresh clone."
+            f"UniVidX: expected {init_py} to exist. The vendored upstream "
+            f"copy at {upstream_dir!r} looks incomplete — restore it with "
+            "`git checkout -- UniVidX` in the node pack's directory."
         )
     try:
         spec = importlib.util.spec_from_file_location(
@@ -308,10 +308,35 @@ def _assert_pipeline_fully_wired(model: Any, variant: str) -> None:
             "silently emit ordinary video. Expected adapters: "
             f"{', '.join(_LORA_MODALITIES[variant])}."
         )
+    # Adapters that exist are not adapters that were LOADED. Upstream
+    # wraps the checkpoint load in a try/except that only prints
+    # (univid_intrinsic.py:1405-1414), so a truncated or wrong checkpoint
+    # leaves every adapter at its initialisation — and PEFT initialises
+    # lora_B to zero, making the adapters exact no-ops. The DiT then runs
+    # as vanilla Wan2.1 while passing every check above.
+    if not _any_lora_b_nonzero(dit):
+        raise RuntimeError(
+            f"UniVidX: the {variant} checkpoint did not load — every LoRA "
+            "adapter is still at its zero initialisation, so the node would "
+            "emit plain Wan2.1 video. Look above for upstream's \"Failed to "
+            "resume training from checkpoint\" message; a partial download "
+            "is the usual cause. Delete the checkpoint under "
+            "ComfyUI/models/unividx/ and let the loader fetch it again."
+        )
     logger.info(
         "UniVidX: pipeline wired — text encoder + VAE present, LoRA "
-        "adapters attached (%s).", ", ".join(_LORA_MODALITIES[variant]),
+        "adapters attached and loaded (%s).",
+        ", ".join(_LORA_MODALITIES[variant]),
     )
+
+
+def _any_lora_b_nonzero(dit) -> bool:
+    """True once any `lora_B` weight is non-zero. Stops at the first hit,
+    which on a loaded checkpoint is the first tensor examined."""
+    for name, param in dit.named_parameters():
+        if "lora_B" in name and param.numel() and bool(param.detach().any()):
+            return True
+    return False
 
 
 # ── VRAM buffer auto-sizing ─────────────────────────────────────────────────
@@ -362,20 +387,9 @@ def auto_vram_buffer_gb(*, fp8: bool) -> float:
     Returns GB to keep free. Larger reservation => more offloading =>
     more room for the sampler's peak allocation.
 
-    `fp8` widens the reservation rather than narrowing it, for two
-    compounding reasons:
-
-      1. FP8 halves the DiT's resident bytes (~28 -> ~14 GB), so there
-         is simply more card left to hand to activations.
-      2. More importantly, FP8-quantized layers CANNOT be offloaded at
-         all under the current ordering — apply_fp8_substitution runs
-         after enable_vram_management and replaces its AutoWrappedLinear
-         wrappers (see the long comment at the call site). So on an FP8
-         run, DiffSynth's streaming is not available as a safety valve
-         and the reservation is the ONLY thing standing between the
-         sampler's peak allocation and an OOM.
-
-    Either way FP8 is not a reason to reserve less.
+    `fp8` widens the reservation rather than narrowing it: FP8 halves the
+    DiT's resident bytes (~28 -> ~14 GB), so there is simply more card
+    left to hand to activations. It is not a reason to reserve less.
     """
     total = total_vram_gb()
     if total is None:
@@ -410,6 +424,26 @@ def auto_vram_buffer_gb(*, fp8: bool) -> float:
         # subsequent OOM is at least explainable.
         reserve = min(reserve, max(1.0, total * 0.1))
     return round(max(0.0, reserve), 1)
+
+
+def free_comfy_vram() -> None:
+    """Unload the models ComfyUI itself manages and release cached VRAM.
+
+    This model lives outside ComfyUI's model management, and DiffSynth
+    sizes its VRAM budget from the card's TOTAL memory — so anything
+    ComfyUI still holds (an earlier node's model, the previous workflow's
+    checkpoint) is memory the budget assumes is free. Called before a
+    load and before each sampling run. No-op outside ComfyUI.
+    """
+    try:
+        import comfy.model_management as mm
+    except ImportError:
+        return
+    try:
+        mm.unload_all_models()
+        mm.soft_empty_cache()
+    except Exception as exc:  # never fail a render over housekeeping
+        logger.debug("UniVidX: could not free ComfyUI VRAM (%s)", exc)
 
 
 def _coerce_attention_backend(value) -> str:
@@ -461,6 +495,19 @@ def instrument_vae_encode(model_instance, *, tiled: bool, tile_size,
     )
 
 
+def sampler_progress(callback):
+    """Sampler-facing wrapper around advanced.sampler_progress: report each
+    denoising step of the pipe() call it wraps, and honour Cancel."""
+    from . import advanced as _adv
+    return _adv.sampler_progress(callback)
+
+
+def context_window_starts(total: int, size: int, stride: int) -> list[int]:
+    """Sampler-facing wrapper around advanced.context_window_starts."""
+    from . import advanced as _adv
+    return _adv.context_window_starts(total, size, stride)
+
+
 def tea_cache_report(tea_cache) -> Optional[str]:
     """Sampler-facing wrapper around advanced.tea_cache_report."""
     if tea_cache is None:
@@ -497,11 +544,13 @@ def load_model(
                           LoRA so num_inference_steps=4 + cfg_scale=1
                           produces reasonable output (5× faster wall).
       distill_strength — float (0..1+), merge strength.
-      compile_dit      — bool, torch.compile the DiT (~20-30% faster
-                          per-step after first-call warmup).
+      compile_dit      — bool, torch.compile each DiT block in place
+                          (speedup unmeasured on this model).
       attention_backend — "auto" | "sdpa" | "flash_attn_2" | "sage".
-                          UniVidX hardcodes SDPA; "auto" picks the
-                          fastest available (sage → FA2 → SDPA).
+                          UniVidX hardcodes SDPA; "auto" picks FA2 if
+                          importable, else SDPA.
+
+    `dtype` is accepted for the loader's sake but upstream pins bf16.
 
     The cache key includes every advanced knob so a change forces a
     rebuild. Loaded models go in the LRU; default size 1 (only one
@@ -520,11 +569,18 @@ def load_model(
     compile_dit_flag = bool(adv.get("compile_dit", False))
     attention_backend = _coerce_attention_backend(adv.get("attention_backend", "auto"))
 
+    # `dtype` is deliberately NOT part of the key: upstream's constructor
+    # hardcodes bf16 (univid_intrinsic.py:1369-1370), so the loader's
+    # fp16 option cannot change the model and must not trigger a reload.
+    if dtype != torch.bfloat16:
+        logger.warning(
+            "UniVidX: dtype=%s ignored — UniVidX's pipeline is hardcoded to "
+            "bf16 upstream, so the model always runs in bf16.", dtype,
+        )
     cache_key = (
         variant,
         os.path.realpath(wan21_path),
         os.path.realpath(ckpt_path),
-        str(dtype),
         float(vram_buffer_gb),
         fp8_quantize, distill_lora, distill_strength,
         compile_dit_flag, attention_backend,
@@ -561,21 +617,23 @@ def load_model(
                 "(another custom node had monkey-patched it globally)",
             )
 
+        # ComfyUI's own models (from earlier nodes in this graph, or a
+        # previous workflow) are invisible to DiffSynth's VRAM budget,
+        # which is computed from the card's TOTAL memory.
+        free_comfy_vram()
+
         logger.info(
-            "UniVidX: loading %s pipeline (Wan2.1=%s, ckpt=%s, dtype=%s, "
+            "UniVidX: loading %s pipeline (Wan2.1=%s, ckpt=%s, "
             "vram_buffer=%.1f GB) — first load is multi-minute.",
-            variant, wan21_path, ckpt_path, dtype, vram_buffer_gb,
+            variant, wan21_path, ckpt_path, vram_buffer_gb,
         )
         with unividx_cwd(upstream_dir):
             PipelineCls = _import_pipeline_class(variant, upstream_dir)
 
             # Attention backend: install AFTER the pipeline class import,
-            # never before. We patch module globals through sys.modules, and
-            # `src.models.wan_video_dit_{intrinsic,alpha}` only exist once
-            # the pipeline module has pulled them in. The previous
-            # implementation ran before this line, so its patch found
-            # nothing and silently left the model on stock SDPA.
-            adv_mod.install_attention_backend(attention_backend)
+            # never before — it patches the DiT module's globals, reached
+            # through the class (see install_attention_backend).
+            adv_mod.install_attention_backend(attention_backend, PipelineCls)
             model = PipelineCls(**_pipeline_kwargs(variant, wan21_path, ckpt_path))
             _assert_pipeline_fully_wired(model, variant)
 
@@ -585,9 +643,8 @@ def load_model(
             # doing it here means the fix is part of the cached model
             # rather than something the sampler has to remember.
             adv_mod.install_sliding_window_support(model)
-
-            # mmgp safetensors patch: read-only mmap for Windows.
-            adv_mod.patch_unividx_load_file_to_readonly()
+            # Per-step progress and Cancel for the sampler node.
+            adv_mod.install_progress_hook(model)
 
             # Step-distill merge MUST happen BEFORE
             # enable_vram_management — once vram-mgmt wraps non-Linear
@@ -649,10 +706,10 @@ def load_model(
 
             # torch.compile: LAST — needs the final module graph.
             if compile_dit_flag:
-                adv_mod.compile_dit(model)
+                n_blocks = adv_mod.compile_dit(model)
                 logger.info(
-                    "UniVidX: DiT compiled with torch.compile (first "
-                    "sampler step will pay a 60-120 sec capture cost)."
+                    "UniVidX: %d DiT blocks set to torch.compile (the first "
+                    "sampler step pays the compile cost).", n_blocks,
                 )
 
         _MODEL_CACHE[cache_key] = model

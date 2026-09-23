@@ -26,7 +26,6 @@ until explicitly enabled.
 from __future__ import annotations
 
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -199,7 +198,8 @@ def apply_fp8_substitution(model, variant: str) -> None:
     Preferred over both, when VRAM management has already wrapped the
     DiT: convert those wrappers in place instead of replacing them, so
     the layers stay FP8 *and* keep block swapping. See
-    `_apply_fp8_keeping_block_swap`.
+    `_apply_fp8_keeping_block_swap`. With VRAM management on (always, via
+    the loader) the two paths above are fallbacks only.
     """
     if _apply_fp8_keeping_block_swap(model):
         return
@@ -211,36 +211,42 @@ def apply_fp8_substitution(model, variant: str) -> None:
 
 
 def _apply_fp8_keeping_block_swap(model) -> bool:
-    """Quantize the DiT while preserving DiffSynth's block swapping.
+    """Quantize the DiT while preserving block swapping.
 
     Returns True if this path handled it, False to fall through to the
     substitution paths (which pin the quantized layers to the GPU).
 
     Background: `enable_vram_management` wraps each nn.Linear in an
     `AutoWrappedLinear` that owns the CPU<->GPU streaming. The older FP8
-    path then REPLACED those wrappers with plain `FP8Linear` modules,
-    which have no offload/onload — so FP8 halved the DiT's bytes and
-    simultaneously pinned every one of them resident. You could have
-    small weights or streamable weights, not both.
+    path REPLACED those wrappers with plain `FP8Linear` modules, which
+    have no offload/onload — so FP8 halved the DiT's bytes and
+    simultaneously pinned every one of them resident, including through
+    the text-encode and VAE-decode phases where the DiT isn't needed.
 
     Converting the wrapper in place keeps its device/dtype configuration
     and its state machine, and stores the weight as fp8 in *every* state
     — so the GPU-resident copy is 1 byte/param as well, not just the
-    offloaded one. That is the difference that matters here, since the
-    constraint is GPU memory rather than host RAM.
+    offloaded one.
+
+    The wrapper class is taken from the pipeline's own namespace. Upstream
+    wraps with its VENDORED `src.vram_management.AutoWrappedLinear`, not
+    DiffSynth's; an earlier version of this path looked for
+    `diffsynth.core.vram.layers.AutoWrappedLinear` (a package this wrapper
+    doesn't even install), found no instances, and silently fell back to
+    pinning every layer.
     """
     dit = getattr(getattr(model, "pipe", None), "dit", None)
-    if dit is None:
+    wrapper_cls = pipeline_globals(model).get("AutoWrappedLinear")
+    if dit is None or wrapper_cls is None:
         return False
 
     from .fp8_loader import quantize_wrapped_dit_inplace
 
-    report = quantize_wrapped_dit_inplace(dit)
+    report = quantize_wrapped_dit_inplace(dit, wrapper_cls)
     n = report["linears_quantized"]
     if n == 0:
-        # No wrappers found — VRAM management is off, or DiffSynth's
-        # layer module isn't importable. The substitution paths still
-        # give the memory win, just without streaming.
+        # No wrappers found — VRAM management is off. The substitution
+        # paths still give the memory win, just without streaming.
         return False
 
     logger.info(
@@ -309,58 +315,43 @@ def _apply_fp8_substitution_from_file(model, fp8_path: str) -> None:
     )
 
 
-# ─── mmgp safetensors patch (read-only mmap, Windows-friendly) ─────────────
-
-
-def patch_unividx_load_file_to_readonly() -> None:
-    """Replace UniVidX's load_file binding so it uses mmgp.torch_load_file
-    with writable_tensors=False. Idempotent. Call inside the
-    unividx_cwd context after the pipeline classes have been imported.
-
-    mmgp's default writable_tensors=True maps with ACCESS_COPY on
-    Windows which forces a virtual-memory commit equal to the file
-    size — six 9.84 GB DiT shards mmapped concurrently blow past the
-    pagefile and produce [WinError 1455]. UniVidX only reads from the
-    loaded tensors (state_dict.update + load_state_dict), so a
-    read-only mmap is sufficient.
-    """
-    import sys as _sys
-    try:
-        import mmgp.safetensors2 as _mmgp_st
-    except ImportError:
-        return  # mmgp not installed — nothing to patch
-
-    def _readonly_load_file(filename, device="cpu"):
-        return _mmgp_st.torch_load_file(filename, device=device, writable_tensors=False)
-    _readonly_load_file._unividx_readonly_patch = True  # type: ignore[attr-defined]
-
-    for mod_name in ("src.pipelines.univid_intrinsic", "src.pipelines.univid_alpha"):
-        mod = _sys.modules.get(mod_name)
-        if mod is None:
-            continue
-        existing = getattr(mod, "load_file", None)
-        if getattr(existing, "_unividx_readonly_patch", False):
-            continue
-        mod.load_file = _readonly_load_file
-
-
 # ─── torch.compile ──────────────────────────────────────────────────────────
 
 
-def compile_dit(model) -> None:
-    """torch.compile the assembled DiT for ~20-30% per-step speedup on
-    Blackwell/Ada. Mode 'reduce-overhead' uses CUDA Graphs where safe;
-    dynamic=True keeps a single compile valid across resolution changes.
+def compile_dit(model) -> int:
+    """torch.compile each of the DiT's transformer blocks, in place.
+
+    Per block, not the whole DiT, because upstream never calls the DiT's
+    own `forward`: `model_fn_wan_video` reaches in for `dit.blocks[i]`,
+    `dit.head`, `dit.patchify` and friends directly. Compiling the DiT
+    module therefore compiled a `forward` nothing runs — the previous
+    `pipe.dit = torch.compile(dit)` produced zero compiled graphs, costing
+    a wrapper layer and buying nothing. The blocks are where the time goes
+    anyway (40 of them, every step, every window).
+
+    `Module.compile()` rather than `torch.compile(module)`: it compiles in
+    place, so the block keeps its identity and its state-dict keys, and
+    DiffSynth's offload/onload walk over `dit.modules()` still reaches every
+    wrapped layer.
+
+    Default mode, not "reduce-overhead". That mode means CUDA graphs, which
+    record fixed tensor addresses — but block swapping moves weights
+    between CPU and GPU every run, so recorded graphs would be invalidated
+    (or re-recorded) constantly. `dynamic=True` keeps one compile valid
+    across resolutions and window lengths.
+
+    Returns the number of blocks compiled.
     """
     dit = getattr(getattr(model, "pipe", None), "dit", None)
-    if dit is None:
+    blocks = getattr(dit, "blocks", None)
+    if blocks is None:
         raise RuntimeError(
-            "Cannot find model.pipe.dit to compile — UniVidX pipeline "
+            "Cannot find model.pipe.dit.blocks to compile — UniVidX pipeline "
             "structure may have changed."
         )
-    model.pipe.dit = torch.compile(
-        dit, mode="reduce-overhead", dynamic=True, fullgraph=False,
-    )
+    for block in blocks:
+        block.compile(dynamic=True, fullgraph=False)
+    return len(blocks)
 
 
 # ─── SDPA pollution restoration ─────────────────────────────────────────────
@@ -411,26 +402,42 @@ ATTENTION_BACKENDS = ("auto", "sdpa", "flash_attn_2", "sage")
 TEACACHE_MODEL_ID = "Wan2.1-T2V-14B"
 
 
-def pipeline_globals(model_instance) -> dict:
-    """The module namespace of the loaded pipeline class.
+def pipeline_globals(model_or_cls) -> dict:
+    """The module namespace of the loaded pipeline class. Accepts the
+    class itself or an instance of it.
 
     We cannot just `import src.pipelines.univid_intrinsic` at sampling
     time: runtime._own_the_src_name() hands the top-level `src` name back
     to whichever other custom node owns it the moment the import finishes,
     so the module is no longer in sys.modules. The class object still
-    references its own globals, and that is where `TeaCache` and
-    `TemporalTiler_BCTHW` live (univid_intrinsic.py:10).
+    references its own globals, and that is where `TeaCache`,
+    `TemporalTiler_BCTHW`, `tqdm`, `WanModel` and `AutoWrappedLinear` live
+    (univid_intrinsic.py:1-21).
+
+    The same goes for every module upstream imported: reach them through
+    an object they define, never through `sys.modules`.
     """
+    cls = model_or_cls if isinstance(model_or_cls, type) else type(model_or_cls)
     try:
-        return type(model_instance).__init__.__globals__
+        return cls.__init__.__globals__
     except AttributeError:
         return {}
+
+
+def _dit_module_globals(model_or_cls) -> Optional[dict]:
+    """Globals of the DiT module the pipeline actually uses
+    (`src.models.wan_video_dit_{intrinsic,alpha}`), via its `WanModel`."""
+    wan_model = pipeline_globals(model_or_cls).get("WanModel")
+    init = getattr(wan_model, "__init__", None)
+    return getattr(init, "__globals__", None)
 
 
 def instrument_vae_encode(model_instance, *, tiled: bool,
                           tile_size, tile_stride) -> bool:
     """Time the conditioning VAE encode, and give it the tiling settings
-    upstream forgets to pass. Idempotent.
+    upstream forgets to pass. Call once per sampler run: the wrapper is
+    installed on the first call, and every call refreshes the settings it
+    applies.
 
     Two separate problems with `WanVideoVAE.encode`
     (wan_video_vae.py:1218) as upstream calls it for conditioning:
@@ -451,21 +458,28 @@ def instrument_vae_encode(model_instance, *, tiled: bool,
     The timer is always on: this sits in a stretch between "sampling
     started" and the first progress tick that was ~9 minutes on a real
     job with no visibility into where it went.
+
+    The settings live on the wrapper, not in its closure. They used to be
+    captured by the first call, so toggling the sampler's `tiled` widget
+    on a cached model silently kept the first run's encode tiling.
     """
     pipe = getattr(model_instance, "pipe", None)
     vae = getattr(pipe, "vae", None) if pipe is not None else None
     if vae is None or not hasattr(vae, "encode"):
         return False
-    inner = vae.encode
-    if getattr(inner, "_bat_encode_wrapper", False):
+    settings = {"tiled": tiled, "tile_size": tile_size,
+                "tile_stride": tile_stride}
+    current = vae.encode
+    if getattr(current, "_bat_encode_wrapper", False):
+        current._bat_settings.update(settings)
         return True
+    inner = current
 
     def encode(videos, device, **kwargs):
         # Only fill in what the caller omitted — the training path passes
         # its own and must keep it.
-        kwargs.setdefault("tiled", tiled)
-        kwargs.setdefault("tile_size", tile_size)
-        kwargs.setdefault("tile_stride", tile_stride)
+        for key, value in encode._bat_settings.items():
+            kwargs.setdefault(key, value)
         t0 = time.perf_counter()
         try:
             return inner(videos, device, **kwargs)
@@ -477,15 +491,164 @@ def instrument_vae_encode(model_instance, *, tiled: bool,
             )
 
     encode._bat_encode_wrapper = True
+    encode._bat_settings = settings
     vae.encode = encode
     return True
 
 
-def install_sliding_window_support(model_instance) -> bool:
-    """Make upstream's temporal tiler actually usable. Idempotent.
+# ─── Progress + cancellation ────────────────────────────────────────────────
+# upstream's denoising loop is `for ... in tqdm(timesteps)` inside
+# pipe.__call__, so ComfyUI never hears about individual steps: the node
+# showed no progress for the whole render, and Cancel did nothing until
+# pipe() returned — hours, on a long clip. We swap the `tqdm` name in the
+# pipeline module's globals for a wrapper that reports each step to
+# whichever callback the sampler node has registered for this run.
 
-    Two independent defects make the vendored sliding-window path
-    unrunnable as shipped:
+_active_step_callback = None
+
+
+def _throw_if_interrupted() -> None:
+    """Honour ComfyUI's Cancel button. No-op outside ComfyUI."""
+    try:
+        import comfy.model_management as mm
+    except ImportError:
+        return
+    mm.throw_exception_if_processing_interrupted()
+
+
+def install_progress_hook(model_instance) -> bool:
+    """Route upstream's per-step tqdm through `sampler_progress()`.
+    Idempotent; a no-op for runs without an active callback."""
+    g = pipeline_globals(model_instance)
+    original = g.get("tqdm")
+    if original is None:
+        logger.warning("UniVidX: no tqdm in the pipeline namespace — "
+                       "per-step progress unavailable.")
+        return False
+    if getattr(original, "_bat_progress_hook", False):
+        return True
+
+    def _reporting(iterator, callback):
+        for item in iterator:
+            _throw_if_interrupted()
+            yield item
+            callback()
+
+    def tqdm(*args, **kwargs):
+        iterator = original(*args, **kwargs)
+        callback = _active_step_callback
+        return iterator if callback is None else _reporting(iterator, callback)
+
+    tqdm._bat_progress_hook = True
+    g["tqdm"] = tqdm
+    return True
+
+
+class sampler_progress:
+    """Context manager: report each denoising step of the pipe() call it
+    wraps to `callback()` (e.g. a ComfyUI ProgressBar update), and check
+    for Cancel before every step. Requires `install_progress_hook`."""
+
+    def __init__(self, callback):
+        self._callback = callback
+
+    def __enter__(self):
+        global _active_step_callback
+        _active_step_callback = self._callback
+        return self
+
+    def __exit__(self, *exc):
+        global _active_step_callback
+        _active_step_callback = None
+        return False
+
+
+# ─── Temporal context windows ───────────────────────────────────────────────
+
+
+def context_window_starts(total: int, size: int, stride: int) -> list[int]:
+    """Start indices of the temporal windows covering `total` latent frames.
+
+    Every window is exactly `size` long. Windows advance by `stride`, and
+    when that doesn't land the last one on the end of the clip, a final
+    window is placed flush with the end instead. Upstream's tiler let the
+    last window run short — sometimes only a few latent frames, i.e. with
+    almost no temporal context — which made the tail of long renders
+    visibly weaker than the rest. The shifted last window simply overlaps
+    its neighbour by more than `size - stride`.
+    """
+    if total <= size:
+        return [0]
+    starts = list(range(0, total - size + 1, stride))
+    if starts[-1] + size < total:
+        starts.append(total - size)
+    return starts
+
+
+def _window_blend_mask(length: int, left: int, right: int) -> torch.Tensor:
+    """Per-frame weight for one window: linear ramps across the frames it
+    shares with its left/right neighbours, 1 elsewhere, never 0.
+
+    A ramp over an overlap of `w` frames runs (1..w)/(w+1) upward on the
+    incoming window and mirrored on the outgoing one, so the two sum to
+    exactly 1 — a true crossfade. Where two ramps meet (overlap larger than
+    half a window) the smaller weight wins.
+    """
+    mask = torch.ones(length, dtype=torch.float32)
+    if left > 0:
+        ramp = torch.arange(1, left + 1, dtype=torch.float32) / (left + 1)
+        mask[:left] = torch.minimum(mask[:left], ramp)
+    if right > 0:
+        ramp = torch.arange(right, 0, -1, dtype=torch.float32) / (right + 1)
+        mask[length - right:] = torch.minimum(mask[length - right:], ramp)
+    return mask
+
+
+def run_context_windows(model_fn, *, size: int, stride: int,
+                        model_kwargs: dict,
+                        tensor_names=("latents", "y")) -> torch.Tensor:
+    """Run `model_fn` once per temporal window and blend the predictions.
+
+    Replaces upstream's `TemporalTiler_BCTHW.run` (util.py:958). Same
+    contract — slice every named (B, C, T, H, W) tensor along T, call
+    `model_fn(**model_kwargs)` per window, blend — with three changes:
+    full-length windows (`context_window_starts`), crossfade ramps sized to
+    each actual overlap, and float32 accumulation (upstream accumulated in
+    the latents' bf16, rounding every overlapped frame twice).
+    """
+    tensors = {n: model_kwargs[n] for n in tensor_names
+               if model_kwargs.get(n) is not None}
+    reference = tensors["latents"]
+    total = reference.shape[2]
+    starts = context_window_starts(total, size, stride)
+
+    value = None
+    weight = torch.zeros(total, dtype=torch.float32, device=reference.device)
+    for i, start in enumerate(starts):
+        _throw_if_interrupted()
+        end = start + size
+        window_kwargs = dict(model_kwargs)
+        for name, tensor in tensors.items():
+            window_kwargs[name] = tensor[:, :, start:end]
+        out = model_fn(**window_kwargs)
+        if value is None:
+            value = torch.zeros(
+                (*out.shape[:2], total, *out.shape[3:]),
+                dtype=torch.float32, device=out.device,
+            )
+        left = starts[i - 1] + size - start if i > 0 else 0
+        right = end - starts[i + 1] if i + 1 < len(starts) else 0
+        mask = _window_blend_mask(end - start, left, right).to(out.device)
+        value[:, :, start:end] += out.float() * mask.view(1, 1, -1, 1, 1)
+        weight[start:end] += mask.to(weight.device)
+    value /= weight.to(value.device).view(1, 1, -1, 1, 1)
+    return value.to(reference.dtype)
+
+
+def install_sliding_window_support(model_instance) -> bool:
+    """Make temporal context windowing work. Idempotent.
+
+    Upstream ships a sliding-window path that is unrunnable as shipped:
 
     1. `model_fn_wan_video` in univid_intrinsic.py:1220-1235 hand-builds
        `model_kwargs` for the recursive call and OMITS `training_mode`
@@ -502,11 +665,9 @@ def install_sliding_window_support(model_instance) -> bool:
        nothing is enumerated, so the next upstream parameter to appear is
        carried automatically.
 
-    2. `TemporalTiler_BCTHW.build_1d_mask` (util.py:944) lacks the
-       `border_width == 0` guard the diffsynth original has. With
-       stride == size the ramp width is 0, `x[-0:]` selects the whole
-       tensor, and the assignment raises. Our planner never emits that,
-       but a subclass with the guard makes it a no-op instead of a crash.
+    2. Its tiler (`TemporalTiler_BCTHW`, util.py:940) crashes on a zero
+       blend width, lets the final window run short, and accumulates in
+       bf16. `run_context_windows` replaces it.
 
     Returns True if the patch is installed.
     """
@@ -522,21 +683,6 @@ def install_sliding_window_support(model_instance) -> bool:
     if getattr(original, "_bat_window_patch", False):
         return True
 
-    tiler_cls = pipeline_globals(model_instance).get("TemporalTiler_BCTHW")
-    if tiler_cls is None:
-        logger.warning(
-            "UniVidX: TemporalTiler_BCTHW not found in the pipeline "
-            "namespace — context windowing unavailable.",
-        )
-        return False
-
-    class _GuardedTiler(tiler_cls):
-        def build_1d_mask(self, length, left_bound, right_bound, border_width):
-            if border_width <= 0:
-                return torch.ones((length,))
-            return super().build_1d_mask(length, left_bound, right_bound,
-                                         border_width)
-
     def model_fn(**kwargs):
         size = kwargs.pop("sliding_window_size", None)
         stride = kwargs.pop("sliding_window_stride", None)
@@ -549,15 +695,11 @@ def install_sliding_window_support(model_instance) -> bool:
             # upstream's own (broken) tiling branch can never trigger.
             return original(**kwargs)
 
-        # tensor_names mirrors upstream: "latents" carries the four
-        # modality streams AND the injected conditioning rows, so slicing
-        # it windows the conditioning too. `run` drops names that are
-        # None, which is how y=None (T2V) is handled.
-        return _GuardedTiler().run(
-            original, int(size), int(stride),
-            latents.device, latents.dtype,
-            model_kwargs=kwargs,
-            tensor_names=["latents", "y"],
+        # "latents" carries the four modality streams AND the injected
+        # conditioning rows, so slicing it windows the conditioning too.
+        # `y` is None for T2V and is skipped.
+        return run_context_windows(
+            original, size=int(size), stride=int(stride), model_kwargs=kwargs,
         )
 
     model_fn._bat_window_patch = True
@@ -655,15 +797,6 @@ def tea_cache_report(tea_cache) -> Optional[str]:
         f"{ratio:.2f}x fewer DiT passes. End-to-end gain is lower; VAE "
         f"and text encoding don't skip."
     )
-
-# Modules whose `flash_attention` folds K/V across the batch (the four
-# modality streams) vs. those that don't. See _make_folding_attention.
-_FOLDING_DIT_MODULES = (
-    "src.models.wan_video_dit_intrinsic",
-    "src.models.wan_video_dit_alpha",
-)
-_PLAIN_DIT_MODULES = ("src.models.wan_video_dit",)
-
 
 def _sage_kernel():
     """SageAttention kernel over (B, N, S, D), or None if unavailable."""
@@ -810,45 +943,28 @@ def _make_folding_attention(chain):
     return flash_attention
 
 
-def _make_plain_attention(chain):
-    """Build a `flash_attention` replacement for the base vendored DiT,
-    which takes no `drop_out` and never folds across the batch."""
-    from einops import rearrange
-
-    def flash_attention(q, k, v, num_heads, compatibility_mode=False, **_kwargs):
-        head_dim = q.shape[-1] // num_heads
-        q2 = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k2 = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v2 = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        use = [("sdpa", None)] if compatibility_mode else chain
-        x = _attend(q2, k2, v2, use, head_dim)
-        return rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-
-    return flash_attention
-
-
-def install_attention_backend(requested: str = "auto") -> str:
+def install_attention_backend(requested: str, pipeline_cls) -> str:
     """Replace UniVidX's hardcoded-SDPA attention with a real dispatcher.
 
     Upstream's `get_optimal_attention_mode()`
     (wan_video_dit_intrinsic.py:10-21) is a stub: every branch, including
     the `except`, returns "scaled_dot_product", and `FLASH_ATTN_3_AVAILABLE`
     is hardcoded False inside a `try` that cannot fail. All three branches
-    of `flash_attention` therefore end in F.scaled_dot_product_attention.
-    Since UniVidX folds four modality streams into one length-4S sequence,
-    attention cost scales as 16·n·S² — so this is the hottest code in the
-    model, pinned to the slowest backend.
+    of `flash_attention` therefore end in F.scaled_dot_product_attention,
+    and K/V are folded with `.repeat` rather than `.expand`.
 
-    MUST be called AFTER the pipeline class has been imported: we patch
-    module globals via sys.modules, and `src.models.wan_video_dit_intrinsic`
-    only exists once `src.pipelines.univid_intrinsic` has been imported.
-    (The previous `force_sage_over_fa2` ran before the import, so its
-    vendored-module patch silently hit nothing.)
+    `pipeline_cls` is the imported UniVidIntrinsic / UniVidAlpha class.
+    The DiT module is reached through it — its `WanModel`'s globals — and
+    patched there, because the DiT's attention looks `flash_attention` up
+    as a module global at call time. This used to be done via
+    `sys.modules["src.models.wan_video_dit_intrinsic"]`, but
+    runtime._own_the_src_name() evicts every `src.*` module the moment the
+    pipeline import finishes, so that lookup always found nothing: the
+    backend setting and the `.expand` saving never took effect, and every
+    load logged "no DiT module was patched".
 
     Returns the resolved backend name actually installed.
     """
-    import sys as _sys
-
     if requested not in ATTENTION_BACKENDS:
         logger.warning(
             "UniVidX: unknown attention_backend %r, falling back to 'auto'.",
@@ -865,69 +981,18 @@ def install_attention_backend(requested: str = "auto") -> str:
             "using %r instead.", requested, resolved,
         )
 
-    patched = []
-    for mod_name, factory in (
-        *((m, _make_folding_attention) for m in _FOLDING_DIT_MODULES),
-        *((m, _make_plain_attention) for m in _PLAIN_DIT_MODULES),
-    ):
-        mod = _sys.modules.get(mod_name)
-        if mod is None or not hasattr(mod, "flash_attention"):
-            continue
-        mod.flash_attention = factory(chain)
-        patched.append(mod_name.rsplit(".", 1)[-1])
-
-    # DiffSynth's own Wan DiT (used by the VAE/text-encoder side) has the
-    # same signature as the base vendored module.
-    try:
-        from diffsynth.models import wan_video_dit as _ds_dit
-        if hasattr(_ds_dit, "flash_attention"):
-            _ds_dit.flash_attention = _make_plain_attention(chain)
-            patched.append("diffsynth.wan_video_dit")
-    except ImportError:
-        pass
-
-    if not patched:
+    dit_globals = _dit_module_globals(pipeline_cls)
+    if dit_globals is None or "flash_attention" not in dit_globals:
         logger.warning(
-            "UniVidX: attention backend %r resolved but no DiT module was "
-            "patched — the model may not be imported yet. Attention stays "
-            "on stock SDPA.", resolved,
+            "UniVidX: could not find the DiT's flash_attention through %s — "
+            "upstream's layout changed. Attention stays on stock SDPA.",
+            getattr(pipeline_cls, "__name__", pipeline_cls),
         )
-    else:
-        logger.info(
-            "UniVidX: attention backend = %s (patched: %s)",
-            resolved, ", ".join(patched),
-        )
-    return resolved
+        return "sdpa"
 
-
-# ─── Runtime FP8 quantize via mmgp/optimum-quanto ──────────────────────────
-
-
-def quantize_dit_fp8(model, qtype: str = "qfloat8") -> None:
-    """Post-quantize model.pipe.dit to FP8 via mmgp/optimum-quanto.
-
-    qtype is an optimum-quanto qtype name — "qfloat8" (e4m3) or
-    "qfloat8_e5m2". LoRA adapter layers are excluded so rank-32
-    adapters stay in BF16 — quantizing them gives no memory win and
-    tends to degrade adapter quality.
-
-    EXPERIMENTAL: the quantize() pass over the LoRA-attached DiT can
-    take 10+ min and has hung on some Wan2.1-14B + UniVidX adapter
-    stack combinations in upstream's testing.
-    """
-    try:
-        from mmgp import offload as _mmgp_offload  # noqa: F401
-    except ImportError as e:
-        raise RuntimeError(
-            "FP8 quantization (mmgp/quanto path) requested but mmgp is "
-            "not installed. Run `pip install mmgp` or use the "
-            "fp8_prequantized path instead."
-        ) from e
-    raise NotImplementedError(
-        "BAT v2: runtime FP8 quantize via mmgp is intentionally not "
-        "exposed yet — use `dit_weight_mode=fp8_prequantized` via "
-        "apply_fp8_substitution() above. The runtime-quantize path "
-        "(mmgp.offload.quantize) is the EXPERIMENTAL one that hangs "
-        "on some adapter stacks. We'll add it back when the hang's "
-        "been fixed upstream."
+    dit_globals["flash_attention"] = _make_folding_attention(chain)
+    logger.info(
+        "UniVidX: attention backend = %s (patched %s)",
+        resolved, dit_globals.get("__name__", "DiT module"),
     )
+    return resolved

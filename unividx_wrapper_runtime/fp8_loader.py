@@ -449,67 +449,68 @@ def load_fp8_state_dict_into(model: nn.Module, state_dict: dict) -> dict:
 # ─── FP8 that survives block swapping ───────────────────────────────────────
 
 
-def _autowrapped_linear_cls():
-    """DiffSynth's AutoWrappedLinear, or None if unavailable."""
-    try:
-        from diffsynth.core.vram.layers import AutoWrappedLinear
-        return AutoWrappedLinear
-    except ImportError:
-        return None
+_STREAMABLE_FP8_CLASSES: dict = {}
 
 
-def make_streamable_fp8_class():
-    """Build `AutoWrappedFP8Linear`, or return None if DiffSynth's VRAM
-    layer isn't importable.
+def make_streamable_fp8_class(base: type) -> type:
+    """Build (once per base) `AutoWrappedFP8Linear`, a subclass of the
+    VRAM-management wrapper `base` that stores its weight as scaled fp8.
+
+    `base` is upstream's vendored `src.vram_management.AutoWrappedLinear`,
+    taken from the pipeline's namespace by the caller. Its contract:
+    `offload()` / `onload()` / `keep()` move the module between states 0 /
+    1 / 2 with `Module.to(dtype=..., device=...)`, and `forward` either
+    uses the weight where it sits or casts a temporary copy to the
+    computation device and dtype.
 
     Why this exists: `FP8Linear` above is a plain `nn.Module`, so
-    substituting it for DiffSynth's `AutoWrappedLinear` throws away the
-    offload/onload machinery — quantized layers stop streaming and pin
-    themselves to the GPU. You got FP8's smaller footprint *or* block
-    swapping, never both, and on this model the sampler's peak is large
-    enough to want both.
+    substituting it for the wrapper throws away the offload/onload
+    machinery — quantized layers stop streaming and pin themselves to the
+    GPU. Subclassing keeps every state transition; what changes:
 
-    This subclasses `AutoWrappedLinear` instead, so every state
-    transition (offload / onload / preparing / computation) is inherited
-    untouched. All we add is the dequantize on the way into the matmul.
+    * **Every state holds fp8.** offload/onload dtypes are set to fp8, and
+      `keep()` is overridden to move the weight to the GPU WITHOUT
+      upcasting it. The base `keep()` casts to the computation dtype
+      (bf16), which would silently double every resident layer.
 
-    Two details that are easy to get wrong:
+    * **`forward` dequantizes on the fly.** The fp8 weight crosses PCIe
+      (1 byte/param) when it isn't resident, then is cast to the input's
+      dtype and scaled right before the matmul.
 
     * **The scale is a plain Python float, not a buffer.**
-      `nn.Module.to(dtype=...)` casts every floating-point buffer, and
-      `offload()` calls exactly that with `float8_e4m3fn`. A registered
-      scale buffer would be quantized to fp8 on the first offload and
-      silently corrupt every subsequent forward.
+      `Module.to(dtype=...)` casts every floating-point buffer, and
+      `offload()` calls exactly that with float8_e4m3fn. A registered
+      scale buffer would be quantized on the first offload and silently
+      corrupt every subsequent forward.
 
     * **The bias is taken out of the fp8 path entirely.** It is a
-      per-tensor-scaled *weight* quantization; the bias has its own,
-      much smaller magnitude and no scale of its own, so casting it to
-      fp8 alongside the weight measurably degrades it (~2.8% on a
-      representative layer) for no memory worth having — all the biases
-      in a 14B DiT come to a few MB. It is de-registered as a Parameter
-      so `Module.to(dtype=...)` cannot reach it, kept at the compute
-      dtype, and re-attached in `linear_forward`.
+      per-tensor-scaled *weight* quantization; the bias has its own, much
+      smaller magnitude and no scale, so casting it to fp8 measurably
+      degrades it (~2.8% on a representative layer) for no memory worth
+      having. It is de-registered as a Parameter so `Module.to(dtype=...)`
+      cannot reach it, kept at full precision, and re-attached in forward.
     """
-    base = _autowrapped_linear_cls()
-    if base is None:
-        return None
+    cached = _STREAMABLE_FP8_CLASSES.get(base)
+    if cached is not None:
+        return cached
 
     class AutoWrappedFP8Linear(base):  # type: ignore[misc,valid-type]
-        """AutoWrappedLinear holding a per-tensor-scaled FP8 weight."""
+        """VRAM-managed Linear holding a per-tensor-scaled FP8 weight."""
 
         @classmethod
         def convert(cls, wrapped) -> "AutoWrappedFP8Linear":
-            """Quantize an existing AutoWrappedLinear in place.
+            """Quantize an existing wrapper in place.
 
             In place, rather than building a replacement, so the
-            offload/onload device+dtype configuration DiffSynth already
-            computed for this layer carries over exactly.
+            offload/onload device configuration already computed for this
+            layer carries over exactly.
             """
             w_f32 = wrapped.weight.data.to(torch.float32)
             abs_max = w_f32.abs().max().item()
             scale = 1.0 if abs_max < 1e-12 else abs_max / FP8_E4M3_MAX
 
             wrapped.weight.data = (w_f32 / scale).to(torch.float8_e4m3fn)
+            del w_f32
 
             bias = None
             if wrapped.bias is not None:
@@ -521,29 +522,45 @@ def make_streamable_fp8_class():
             wrapped.__class__ = cls
             wrapped._fp8_scale = float(scale)
             wrapped._fp8_bias = bias
-            # Keep the weight fp8 through every state, so the GPU-resident
-            # copy is 1 byte/param too — not just the offloaded one.
             wrapped.offload_dtype = torch.float8_e4m3fn
             wrapped.onload_dtype = torch.float8_e4m3fn
-            wrapped.preparing_dtype = torch.float8_e4m3fn
             return wrapped
 
-        def linear_forward(self, x, weight, bias):
-            # `weight` arrives from computation() cast to the compute
-            # dtype; undo the quantization scale, then add the bias we
-            # kept out of it.
-            w = weight.to(x.dtype) * self._fp8_scale
-            b = self._fp8_bias
-            if b is not None and (b.device != x.device or b.dtype != x.dtype):
-                b = b.to(device=x.device, dtype=x.dtype)
-                self._fp8_bias = b  # cache the move; biases are tiny
-            return torch.nn.functional.linear(x, w, b)
+        def keep(self):
+            # Base keep() would upcast to the computation dtype.
+            if self.state != 2:
+                self.to(device=self.computation_device)
+                self.state = 2
 
+        def forward(self, x, *args, **kwargs):
+            weight = self.weight
+            if weight.device != x.device:
+                # Not resident. Take a permanent GPU slot if the budget
+                # still allows (the base class's policy), otherwise stream
+                # a temporary copy — in fp8, so half the PCIe traffic.
+                if (self.state != 2 and self.vram_limit is not None
+                        and self.check_free_vram()):
+                    self.keep()
+                    weight = self.weight
+                else:
+                    weight = weight.to(device=x.device, non_blocking=True)
+            weight = weight.to(x.dtype) * self._fp8_scale
+            bias = self._fp8_bias
+            if bias is not None and (bias.device != x.device
+                                     or bias.dtype != x.dtype):
+                bias = bias.to(device=x.device, dtype=x.dtype)
+                self._fp8_bias = bias  # cache the move; biases are tiny
+            return F.linear(x, weight, bias)
+
+    _STREAMABLE_FP8_CLASSES[base] = AutoWrappedFP8Linear
     return AutoWrappedFP8Linear
 
 
-def quantize_wrapped_dit_inplace(model: nn.Module) -> dict:
-    """Convert every AutoWrappedLinear in `model` to a streamable FP8 one.
+def quantize_wrapped_dit_inplace(model: nn.Module, wrapper_cls: type) -> dict:
+    """Convert every `wrapper_cls` Linear in `model` to a streamable FP8 one.
+
+    `wrapper_cls` is the VRAM-management Linear wrapper the pipeline used
+    (upstream's vendored `AutoWrappedLinear`).
 
     Mirrors `quantize_dit_inplace`'s PEFT handling: descend into a
     wrapper holding a `.base_layer` and convert only that, never
@@ -555,28 +572,24 @@ def quantize_wrapped_dit_inplace(model: nn.Module) -> dict:
     `skipped_unwrapped` counts plain nn.Linears found with no wrapper,
     which means VRAM management was not enabled for them.
     """
-    cls = make_streamable_fp8_class()
-    base = _autowrapped_linear_cls()
-    if cls is None or base is None:
-        return {"linears_quantized": 0, "skipped_unwrapped": 0}
-
+    cls = make_streamable_fp8_class(wrapper_cls)
     counts = {"linears_quantized": 0, "skipped_unwrapped": 0}
 
     def _is_target(m) -> bool:
-        return isinstance(m, base) and not isinstance(m, cls)
+        return isinstance(m, wrapper_cls) and not isinstance(m, cls)
 
     def _walk(module: nn.Module) -> None:
         for _name, child in list(module.named_children()):
             inner = getattr(child, "base_layer", None)
             if not _is_target(child) and _is_target(inner):
-                child.base_layer = cls.convert(inner)
+                cls.convert(inner)
                 counts["linears_quantized"] += 1
                 continue  # do NOT recurse: lora_A/lora_B stay bf16
             if _is_target(child):
                 cls.convert(child)
                 counts["linears_quantized"] += 1
                 continue
-            if isinstance(child, nn.Linear) and not isinstance(child, base):
+            if isinstance(child, nn.Linear) and not isinstance(child, wrapper_cls):
                 counts["skipped_unwrapped"] += 1
             _walk(child)
 
