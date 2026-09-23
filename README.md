@@ -44,7 +44,7 @@ First run downloads the Wan2.1-T2V-14B backbone (~57 GB) and the UniVidX checkpo
 
 ```
 [Video Loader] ── images ──┐
-                           ├─→ [🦇 UniVidX Sample] ── result ─→ [🦇 UniVidX Decode] ─→ 4 IMAGE outputs
+                           ├─→ [🦇 UniVidX Sample] ── result ─→ [🦇 UniVidX Decode] ─→ 4 IMAGE + matte MASK
 [🦇 (Down)load UniVidX] ───┘
 ```
 
@@ -72,8 +72,8 @@ Click the **?** on the Sample node for all 30.
 | Node | What it does |
 |---|---|
 | **🦇 (Down)load UniVidX Model** | Picks the variant and resolves weights. Caches the loaded model, so re-running a graph doesn't pay the load cost twice. All the speed/VRAM settings live here. |
-| **🦇 UniVidX Sample** | The sampler. The `mode` dropdown reshapes the node — sockets and widgets both — so you can't wire an input the mode ignores. |
-| **🦇 UniVidX Decode** | Splits the result into 4 IMAGE outputs, named for both families. Slots a mode didn't produce come back black, so your downstream wiring survives a mode change. |
+| **🦇 UniVidX Sample** | The sampler. The `mode` dropdown reshapes the node — sockets and widgets both — so you can't wire an input the mode ignores. Shows per-step progress, and Cancel stops it at the next step. |
+| **🦇 UniVidX Decode** | Splits the result into 4 IMAGE outputs, named for both families, plus the matte as a MASK. Outputs come back at exactly the input clip's resolution and frame count. Slots a mode didn't produce come back black, so your downstream wiring survives a mode change. |
 | **🦇 UniVidX Context Options** *(optional)* | Only if you want to change the windowing defaults for long clips. Windowing is automatic without it. |
 | **🦇 UniVidX Cache Options** *(optional)* | Only if you want TeaCache step-skipping. Off unless wired. |
 
@@ -89,7 +89,7 @@ Worth turning on, in order of payoff:
 |---|---|---|
 | **`distill_lora`** | **~5× faster.** Merge a Wan2.1-**T2V**-14B step-distill LoRA, then run 4 steps at `cfg_scale=1.0`. | Quality. It shifts the base those adapters were trained against — compare albedo and normals before trusting it. An I2V LoRA merges *without error* and quietly degrades output; the loader warns on suspicious filenames. |
 | **Cache Options** (TeaCache) | ~1.4–1.9× on 20-step renders. | Several GB of VRAM (~7 GB at 880×1280×81) and some fidelity. First thing to remove if you're near the ceiling. Pointless below ~8 steps. |
-| **`compile_dit`** | Some per-step speedup. | Tens of seconds compiling on the first step. Not worth it on short or 4-step runs. |
+| **`compile_dit`** | Some per-step speedup (unmeasured on this model). | Minutes compiling on the first step. Not worth it on short or 4-step runs. |
 
 **`vram_buffer_gb` is the block-swapping dial**, and the one to reach for when you OOM. It's how much VRAM to keep **free** for the sampler — layers past the limit stream CPU↔GPU on demand — so *raise* it for more headroom, lower it for speed.
 
@@ -110,7 +110,8 @@ Every setting has fuller guidance behind the **?** on its node, including measur
 - **CUDA OOM at sample time** — the model fitted, the sampler's peak didn't. In order: remove Cache Options if wired, lower `context_frames`, reduce resolution, raise `vram_buffer_gb`.
 - **`mode 'XYZ' is family='alpha' but loaded model is variant='intrinsic'`** — mode and loader variant disagree. Change one.
 - **Tensor size mismatch while sampling** — TeaCache combined with windowing. It should now refuse that and say so; if you see it, the guard was bypassed.
-- **`No module named 'src.pipelines'`** — another custom node has claimed the top-level `src` name (several do). The wrapper rebinds it and logs when it does; if it still fails, the vendored `./UniVidX/src/` is incomplete.
+- **`the upstream copy at … is incomplete`** — files are missing from `./UniVidX/`, usually a partial checkout or a deploy that didn't copy everything. `git checkout -- UniVidX` in the pack directory restores it.
+- **`No module named 'src.pipelines'`** — another custom node has claimed the top-level `src` name (several do). The wrapper rebinds it and logs when it does; if it still fails, see the previous item.
 - **First run takes a long time** — model load plus any first-time download. Later runs reuse everything.
 
 ---
@@ -139,13 +140,15 @@ All four modality streams attend as a single sequence, so cost grows with the sq
 
 Longer clips are split into overlapping windows and blended at every denoising step, rather than cross-fading finished video. Upstream has a tiler for this but it is unrunnable as shipped: the recursive call drops `training_mode` and dies on an `UnboundLocalError`, and its blend mask has no zero-width guard. Both are repaired in `install_sliding_window_support`.
 
-Two known limits: the final window can be shorter than the rest (upstream doesn't shift it back to full length), and positional encoding restarts per window, so overlap hides seams but doesn't prevent slow drift across a very long clip.
+Every window is full length: when the stride doesn't land the last window on the end of the clip, it is shifted back to finish flush with it (upstream let it run short, starving the tail of context). Blending is a true crossfade over each actual overlap, accumulated in float32. One known limit remains: positional encoding restarts per window, so overlap hides seams but doesn't prevent slow drift across a very long clip.
 
 ## Why the sampler reshapes itself
 
 The Sample and Decode nodes use ComfyUI's V3 schema. Sockets and widgets are decided **server-side** by `io.DynamicCombo`, not hidden by JavaScript — the only JS in the pack is the help affordances.
 
-That's also why Decode always has exactly four outputs: ComfyUI has no dynamic-output mechanism. `DynamicCombo` and friends are input-only, V3's `DynamicOutput` is an unimplemented stub, and outputs are memoised class-wide on first schema resolution. Rather than fake it, all four slots are always present and unproduced ones return black.
+That's also why Decode's outputs are fixed — four IMAGE slots plus the matte MASK: ComfyUI has no dynamic-output mechanism. `DynamicCombo` and friends are input-only, V3's `DynamicOutput` is an unimplemented stub, and outputs are memoised class-wide on first schema resolution. Rather than fake it, every slot is always present and unproduced ones return black.
+
+Both renderers are supported — the classic canvas ("Nodes 1.0") and the Vue node renderer ("Nodes 2.0"). `DynamicCombo` is applied to the node's own inputs and widgets, which both draw from; the help is reachable in both (see below). One constraint follows from how saved workflows store widget values — by position — so widgets are never removed or reordered, only added at the end or retuned in place. `denoising_strength` and the loader's `dtype` survive for that reason even though neither is useful (see their tooltips).
 
 The two options nodes are separate rather than one combined node because they're unrelated and each changes output pixels — wiring one should be deliberate. Optional *sockets* also leave saved workflows untouched, where extra widgets would shift the stored value array.
 
@@ -164,7 +167,9 @@ Worth knowing: the negative prompt only matters while guidance is on — the pip
 
 ## Where output geometry comes from
 
-For any mode with an IMAGE input, frame count and resolution come **from the wired clip** (H/W snapped up to a multiple of 16). That's why those modes have no `num_frames`/`height`/`width` widgets — the values would only be overridden. Text-only modes have nothing to measure, so they're the only ones that expose them.
+For any mode with an IMAGE input, frame count and resolution come **from the wired clip**. That's why those modes have no `num_frames`/`height`/`width` widgets — the values would only be overridden. Text-only modes have nothing to measure, so they're the only ones that expose them.
+
+The model needs H/W on a multiple of 16 and a `4k+1` frame count. The clip is edge-padded (never stretched) up to those, and Decode crops and trims the padding off again — so a 1920×1080 plate comes back as 1920×1080, pixel-aligned with the source, ready to composite over it.
 
 ## Reaching the mode reference
 
@@ -178,7 +183,16 @@ Those markdown files are generated from `modes.py` at import rather than hand-wr
 
 ## Deploying
 
-`UniVidX/` is committed, so a deploy that mirrors the repo carries it. Two subdirectories are gitignored because the wrapper creates them at load time as symlinks into `ComfyUI/models/`: `UniVidX/models/` and `UniVidX/checkpoints/`. Don't sync those.
+`UniVidX/` is committed, so a deploy that mirrors the repo carries it. Two subdirectories are gitignored because the wrapper creates them at load time as symlinks into `ComfyUI/models/`: `UniVidX/models/` and `UniVidX/checkpoints/`. Don't sync those. (`UniVidX/src/models/` is different — that is upstream's model *code*, and it must ship.)
+
+## Tests
+
+```bash
+pip install pytest
+COMFYUI_PATH=/path/to/ComfyUI python -m pytest tests
+```
+
+No GPU or weights needed: the tests run the real vendored upstream code on CPU and a stub in place of the 14B pipeline. Without `COMFYUI_PATH` the node-level tests skip and the rest still run.
 
 ## License + credits
 
@@ -193,7 +207,6 @@ The FP8 quantization, distill LoRA pre-merge, torch.compile and sage attention c
 **Depended on, not redistributed:**
 
 - [Wan2.1-T2V-14B](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B) (Apache 2.0) — downloaded at runtime
-- [DiffSynth-Engine](https://github.com/modelscope/DiffSynth-Engine) (Apache 2.0) — pip dependency
 - [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) (BSD 3-Clause) / [SageAttention](https://github.com/thu-ml/SageAttention) — optional
 
 [ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper) (Apache 2.0) informed the context-window defaults and options-node UX. No code was copied.
