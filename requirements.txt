@@ -6,14 +6,18 @@
 #
 # huggingface_hub<1.0 is mandatory: transformers (in ComfyUI) refuses
 # hf_hub 1.x. Same lesson as the DKT wrapper.
+#
+# The rest is exactly what the vendored UniVidX imports on the inference
+# path: `modelscope` (pipelines/util.py, models/downloader.py), `peft` and
+# `accelerate` (trainers/util.py, pulled in by the pipeline classes), `ftfy`
+# (the Wan prompter). Upstream vendors its own VRAM-management and model
+# code, so it needs neither DiffSynth-Studio nor DiffSynth-Engine; the
+# latter used to be listed here, imported by nothing, and dragged in
+# onnxruntime, moviepy, librosa, trimesh and more. imageio, loguru,
+# matplotlib and opencv-python were likewise unused.
 
 huggingface_hub<1.0
-imageio
-ftfy
-accelerate
-loguru
 modelscope
-opencv-python
-matplotlib
 peft
-diffsynth-engine
+accelerate
+ftfy
