@@ -1068,15 +1068,30 @@ class BatUniVidXSample(io.ComfyNode):
         runtime.free_comfy_vram()
         pbar = comfy.utils.ProgressBar(int(num_inference_steps))
         _t_pipe = time.perf_counter()
-        with runtime.unividx_cwd(upstream_dir), \
-                runtime.sampler_progress(lambda: pbar.update(1)):
-            with torch.inference_mode():
-                result_dict = model_instance.pipe(**pipe_args)
+        try:
+            with runtime.unividx_cwd(upstream_dir), \
+                    runtime.sampler_progress(lambda: pbar.update(1)):
+                with torch.inference_mode():
+                    result_dict = model_instance.pipe(**pipe_args)
+        finally:
+            # Also on Cancel or an error: put the model back in RAM
+            # (which empties the CUDA cache) rather than leave its layers
+            # resident until the next run.
+            runtime.offload_pipeline(model_instance)
         logger.info(
             "UniVidX_Sample: pipe() total %.1f s (conditioning encode + "
             "prompt encode + model swaps + %d sampler steps + VAE decode).",
             time.perf_counter() - _t_pipe, int(num_inference_steps),
         )
+
+        # pipe() returns its decoded videos ON the GPU, and ComfyUI caches
+        # this node's output — so they used to sit in VRAM for as long as
+        # the result stayed cached (~11 GB for three 300-frame 1080p
+        # streams). Move them to CPU (still bf16, half float32's size).
+        result_dict = {
+            key: value.cpu() if isinstance(value, torch.Tensor) else value
+            for key, value in result_dict.items()
+        }
 
         # Report what caching actually saved. The threshold -> skip-count
         # mapping is clip-dependent, so the measured number is worth more
@@ -1275,6 +1290,10 @@ def _register_mode_reference_route() -> None:
 
 
 _register_mode_reference_route()
+
+# Make ComfyUI's "Unload models" / "Free model and node cache" reach the
+# UniVidX model, which lives outside ComfyUI's model management.
+runtime.install_comfy_memory_hooks()
 
 # Generate the markdown ComfyUI's native per-node help panel serves from
 # /extensions/<pack>/docs/<NodeName>.md. Unlike the title-bar "?" button

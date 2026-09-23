@@ -209,3 +209,94 @@ def test_attention_patch_reaches_the_dit_and_matches_upstream(variant):
         want = upstream_fn(q, k, v, num_heads=8, drop_out=drop_out)
         got = patched(q, k, v, num_heads=8, drop_out=drop_out)
         assert torch.allclose(got, want, atol=1e-5), drop_out
+
+
+# ── CPU-first streaming DiT load ────────────────────────────────────────────
+
+
+_TINY_DIT = {
+    "has_image_input": False, "patch_size": [1, 2, 2], "in_dim": 16,
+    "dim": 64, "ffn_dim": 128, "freq_dim": 32, "text_dim": 48,
+    "out_dim": 16, "num_heads": 4, "num_layers": 2, "eps": 1e-6,
+}
+
+
+def _upstream_modules():
+    from unividx_wrapper_runtime import runtime
+
+    runtime._add_upstream_to_path(UPSTREAM_DIR)
+    cwd = os.getcwd()
+    os.chdir(UPSTREAM_DIR)
+    try:
+        cls = runtime._import_pipeline_class("intrinsic", UPSTREAM_DIR)
+    finally:
+        os.chdir(cwd)
+    return cls, advanced.pipeline_globals(cls)
+
+
+def _write_tiny_wan_install(root, wan_model_cls):
+    """configs/ + six fp32 shards laid out where upstream looks for them."""
+    import json
+
+    from safetensors.torch import save_file
+
+    (root / "configs").mkdir()
+    (root / "configs" / "wan2_1_14b_t2v_dit_config.json").write_text(
+        json.dumps(_TINY_DIT))
+    torch.manual_seed(0)
+    reference = wan_model_cls(**_TINY_DIT)  # fp32, like the real shards
+    state = {k: v.contiguous() for k, v in reference.state_dict().items()}
+    keys = sorted(state)
+    shard_dir = root / "models" / "Wan-AI" / "Wan2.1-T2V-14B"
+    shard_dir.mkdir(parents=True)
+    for i in range(6):
+        part = {k: state[k] for k in keys[i::6]}
+        save_file(part, str(shard_dir / f"diffusion_pytorch_model-0000{i + 1}-of-00006.safetensors"))
+    return state
+
+
+@requires_upstream
+def test_streaming_dit_load_matches_upstream_bit_for_bit(tmp_path, monkeypatch):
+    cls, g = _upstream_modules()
+    wan_model_cls = g["WanModel"]
+    init_on_meta = g["ModelManager"].__init__.__globals__["init_weights_on_device"]
+    state = _write_tiny_wan_install(tmp_path, wan_model_cls)
+    monkeypatch.chdir(tmp_path)
+
+    streamed = advanced._load_wan_dit_streaming(wan_model_cls, init_on_meta,
+                                                torch.bfloat16)
+    # Upstream: build fp32, cast to bf16, then load the fp32 checkpoint.
+    upstream = wan_model_cls(**_TINY_DIT).to(torch.bfloat16)
+    upstream.load_state_dict(state, strict=False)
+
+    got, want = streamed.state_dict(), upstream.state_dict()
+    assert set(got) == set(want)
+    for key in want:
+        assert got[key].device.type == "cpu" and not got[key].is_meta, key
+        assert got[key].dtype == want[key].dtype, key
+        assert torch.equal(got[key], want[key]), key
+
+
+@requires_upstream
+def test_streaming_dit_load_refuses_incomplete_shards(tmp_path, monkeypatch):
+    cls, g = _upstream_modules()
+    wan_model_cls = g["WanModel"]
+    init_on_meta = g["ModelManager"].__init__.__globals__["init_weights_on_device"]
+    _write_tiny_wan_install(tmp_path, wan_model_cls)
+    from safetensors.torch import save_file
+    save_file({}, str(tmp_path / "models" / "Wan-AI" / "Wan2.1-T2V-14B"
+                   / "diffusion_pytorch_model-00003-of-00006.safetensors"))
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(RuntimeError, match="lack .* DiT weight"):
+        advanced._load_wan_dit_streaming(wan_model_cls, init_on_meta, torch.bfloat16)
+
+
+@requires_upstream
+def test_cpu_first_loader_replaces_from_pretrained_on_this_import_only():
+    cls, g = _upstream_modules()
+    upstream_fn = g["WanVideoPipeline"].from_pretrained
+    assert advanced.install_cpu_first_loading(cls)
+    assert g["WanVideoPipeline"].from_pretrained is not upstream_fn
+    # A fresh import gets upstream's loader back.
+    _, g2 = _upstream_modules()
+    assert g2["WanVideoPipeline"] is not g["WanVideoPipeline"]

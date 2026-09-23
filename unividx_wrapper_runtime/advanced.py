@@ -424,6 +424,154 @@ def pipeline_globals(model_or_cls) -> dict:
         return {}
 
 
+def install_cpu_first_loading(pipeline_cls) -> bool:
+    """Replace `WanVideoPipeline.from_pretrained` for this import of the
+    pipeline with one that loads everything into CPU RAM, streaming the
+    DiT shard by shard. Returns True if installed.
+
+    Upstream's loader (univid_intrinsic.py:401-475, identical in the alpha
+    pipeline) is the worst memory moment of the whole node:
+
+    * The DiT is first built with random fp32 weights (~57 GB of host RAM
+      and a minute or more of random init that the checkpoint then
+      overwrites), then cast to bf16 and moved to the GPU.
+    * All six fp32 shards are read into one dict before any is applied
+      (~57 GB of host RAM at once).
+    * The DiT (~28 GB) and the T5 encoder (~11 GB) are put on the GPU
+      before VRAM management exists, so loading needs ~40 GB of VRAM even
+      though sampling can stream. A 24-32 GB card fails at load. And it
+      buys nothing: the first `load_models_to_device()` of every run
+      moves them straight back to the CPU anyway.
+
+    This version builds the DiT on the meta device (no allocation, no
+    random init), then streams each shard in, casting each tensor to bf16
+    as it arrives. T5 and VAE are loaded to CPU the same way ModelManager
+    always does, just with `device="cpu"`. The pipeline's compute device is
+    unchanged, so DiffSynth still places layers on the GPU at sampling
+    time within its budget. Values are bit-identical to upstream's: the
+    same fp32→bf16 cast, applied to the same checkpoint tensors.
+
+    Coverage is total, not assumed: the intrinsic and alpha DiTs have
+    exactly the parameter names of the plain Wan2.1 DiT that DiffSynth
+    loads from these shards, and any parameter still on the meta device
+    after the last shard is reported as an error rather than left
+    uninitialised.
+
+    The class is freshly imported on every load (see
+    runtime._own_the_src_name), so this never leaks into anything else.
+    """
+    g = pipeline_globals(pipeline_cls)
+    pipe_cls = g.get("WanVideoPipeline")
+    wan_model_cls = g.get("WanModel")
+    model_manager_cls = g.get("ModelManager")
+    if pipe_cls is None or wan_model_cls is None or model_manager_cls is None:
+        logger.warning(
+            "UniVidX: pipeline namespace lacks WanVideoPipeline/WanModel/"
+            "ModelManager — keeping upstream's GPU-first loader.",
+        )
+        return False
+    init_on_meta = model_manager_cls.__init__.__globals__.get(
+        "init_weights_on_device")
+    if init_on_meta is None:
+        logger.warning("UniVidX: init_weights_on_device not found — keeping "
+                       "upstream's GPU-first loader.")
+        return False
+
+    def from_pretrained(
+        torch_dtype=torch.bfloat16, device="cuda", model_configs=(),
+        tokenizer_config=None, local_model_path="./models",
+        skip_download=False, redirect_common_files=True, use_usp=False,
+    ):
+        # UniVidX always passes redirect_common_files=False and never
+        # use_usp; neither is reproduced here.
+        if use_usp:
+            raise NotImplementedError(
+                "UniVidX wrapper: unified sequence parallel is not supported.")
+        pipe = pipe_cls(device=device, torch_dtype=torch_dtype)
+
+        manager = model_manager_cls()
+        for config in model_configs:
+            config.download_if_necessary(local_model_path,
+                                         skip_download=skip_download)
+            manager.load_model(config.path, device="cpu",
+                               torch_dtype=config.offload_dtype or torch_dtype)
+        pipe.text_encoder = manager.fetch_model("wan_video_text_encoder")
+        pipe.dit = _load_wan_dit_streaming(wan_model_cls, init_on_meta,
+                                           torch_dtype)
+        pipe.vae = manager.fetch_model("wan_video_vae")
+        pipe.image_encoder = manager.fetch_model("wan_video_image_encoder")
+        pipe.motion_controller = manager.fetch_model("wan_video_motion_controller")
+        pipe.vace = manager.fetch_model("wan_video_vace")
+
+        tokenizer_config.download_if_necessary(local_model_path,
+                                               skip_download=skip_download)
+        pipe.prompter.fetch_models(pipe.text_encoder)
+        pipe.prompter.fetch_tokenizer(tokenizer_config.path)
+        return pipe
+
+    pipe_cls.from_pretrained = staticmethod(from_pretrained)
+    return True
+
+
+# Upstream's hardcoded DiT location and config, both relative to the
+# UniVidX root (the loader runs inside runtime.unividx_cwd()).
+_WAN_DIT_SHARDS = tuple(
+    f"models/Wan-AI/Wan2.1-T2V-14B/diffusion_pytorch_model-0000{i}-of-00006.safetensors"
+    for i in range(1, 7)
+)
+_WAN_DIT_CONFIG = "configs/wan2_1_14b_t2v_dit_config.json"
+
+
+def _load_wan_dit_streaming(wan_model_cls, init_on_meta, dtype):
+    """Build the DiT on the meta device and fill it one shard at a time.
+
+    Host RAM peaks at the finished bf16 DiT plus one shard's worth of bf16
+    tensors, instead of a random-init fp32 model plus all six fp32 shards.
+    """
+    import json
+
+    from safetensors import safe_open
+
+    with open(_WAN_DIT_CONFIG, "r") as fh:
+        dit_kwargs = json.load(fh)
+    with init_on_meta():
+        dit = wan_model_cls(**dit_kwargs)
+
+    t0 = time.perf_counter()
+    for path in _WAN_DIT_SHARDS:
+        shard = {}
+        with safe_open(path, framework="pt", device="cpu") as fh:
+            for key in fh.keys():
+                shard[key] = fh.get_tensor(key).to(dtype)
+        dit.load_state_dict(shard, strict=False, assign=True)
+        del shard
+
+    missing = [name for name, p in dit.named_parameters() if p.is_meta]
+    if missing:
+        raise RuntimeError(
+            f"UniVidX: the Wan2.1-T2V-14B shards lack {len(missing)} DiT "
+            f"weight(s), e.g. {', '.join(missing[:3])}. The install is "
+            "incomplete or is not Wan2.1-T2V-14B."
+        )
+    logger.info(
+        "UniVidX: DiT streamed into CPU RAM in %.1f s (%.1f GB, %s).",
+        time.perf_counter() - t0,
+        sum(p.numel() * p.element_size() for p in dit.parameters()) / 1024 ** 3,
+        dtype,
+    )
+    return dit
+
+
+def offload_pipeline(model_instance) -> None:
+    """Move every VRAM-managed part of the pipeline to the CPU and release
+    cached VRAM. The model stays loaded (in RAM); the next run moves what
+    it needs back. Uses upstream's own `load_models_to_device([])`."""
+    pipe = getattr(model_instance, "pipe", None)
+    if pipe is None or not hasattr(pipe, "load_models_to_device"):
+        return
+    pipe.load_models_to_device([])
+
+
 def _dit_module_globals(model_or_cls) -> Optional[dict]:
     """Globals of the DiT module the pipeline actually uses
     (`src.models.wan_video_dit_{intrinsic,alpha}`), via its `WanModel`."""

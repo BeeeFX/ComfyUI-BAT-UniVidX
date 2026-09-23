@@ -19,7 +19,11 @@ class _StubPipe:
 
     def __init__(self, tqdm_fn):
         self.calls = []
+        self.device_moves = []
         self._tqdm = tqdm_fn
+
+    def load_models_to_device(self, names):
+        self.device_moves.append(list(names))
 
     def __call__(self, **kwargs):
         self.calls.append(kwargs)
@@ -65,6 +69,9 @@ def test_sample_decode_round_trip_keeps_input_geometry(pack, tmp_path):
         model=model, mode=mode, num_inference_steps=3, seed=1,
     ).result[0]
     kwargs = model[0].pipe.calls[0]
+    # The GPU is handed back after the run: results on CPU, model offloaded.
+    assert model[0].pipe.device_moves == [[]]
+    assert all(t.device.type == "cpu" for t in result["pipe_result"].values())
     assert (kwargs["num_frames"], kwargs["height"], kwargs["width"]) == (13, 1088, 256)
     assert kwargs["cfg_scale"] == 1.0
     assert kwargs["inference_rgb"].device.type == "cpu"
@@ -85,3 +92,38 @@ def test_family_mismatch_is_refused(pack, tmp_path):
     with pytest.raises(ValueError, match="family='intrinsic'"):
         pack.NODE_CLASS_MAPPINGS["BAT_UniVidXSample"].execute(
             model=model, mode=mode, num_inference_steps=1, seed=1)
+
+
+def test_comfyui_memory_buttons_reach_the_model(pack, monkeypatch):
+    import sys
+
+    import comfy.model_management as mm
+    import execution
+
+    runtime = sys.modules[pack.__name__ + ".unividx_wrapper_runtime.runtime"]
+    assert mm.unload_all_models._bat_hooked
+    assert execution.PromptExecutor.reset._bat_hooked
+
+    class Pipe:
+        def __init__(self):
+            self.moves = []
+
+        def load_models_to_device(self, names):
+            self.moves.append(list(names))
+
+    model = type("M", (), {})()
+    model.pipe = Pipe()
+    monkeypatch.setitem(runtime._MODEL_CACHE, ("test",), model)
+
+    # "Unload models": off the GPU, still cached.
+    mm.unload_all_models()
+    assert model.pipe.moves == [[]] and ("test",) in runtime._MODEL_CACHE
+
+    # The sampler's own pre-run cleanup must not offload the model it's
+    # about to use.
+    runtime.free_comfy_vram()
+    assert model.pipe.moves == [[]]
+
+    # "Free model and node cache": released.
+    assert runtime.release_cached_models() == 1
+    assert ("test",) not in runtime._MODEL_CACHE

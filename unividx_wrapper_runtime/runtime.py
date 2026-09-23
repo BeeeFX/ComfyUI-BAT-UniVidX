@@ -434,16 +434,99 @@ def free_comfy_vram() -> None:
     ComfyUI still holds (an earlier node's model, the previous workflow's
     checkpoint) is memory the budget assumes is free. Called before a
     load and before each sampling run. No-op outside ComfyUI.
+
+    Calls ComfyUI's ORIGINAL unload_all_models, bypassing the hook below,
+    which would pointlessly offload the very model about to run.
     """
     try:
         import comfy.model_management as mm
     except ImportError:
         return
+    unload = getattr(mm.unload_all_models, "_bat_original", mm.unload_all_models)
     try:
-        mm.unload_all_models()
+        unload()
         mm.soft_empty_cache()
     except Exception as exc:  # never fail a render over housekeeping
         logger.debug("UniVidX: could not free ComfyUI VRAM (%s)", exc)
+
+
+# ── ComfyUI's memory buttons ────────────────────────────────────────────────
+# The model lives outside ComfyUI's model management, so neither "Unload
+# models" nor "Free model and node cache" used to touch it: the host RAM
+# (tens of GB) stayed held until ComfyUI restarted. Two small hooks bring
+# it in line with how ComfyUI treats its own models:
+#
+#   unload_all_models()      "Unload models", ComfyUI's automatic unload
+#                            after an out-of-memory error, other packs'
+#                            loaders -> OFFLOAD: move everything off the
+#                            GPU, keep it in RAM. The next run moves back
+#                            what it needs in seconds.
+#   PromptExecutor.reset()   "Free model and node cache" -> RELEASE: drop
+#                            the cached model so its RAM is freed; the next
+#                            run reloads it.
+#
+# Both run on ComfyUI's worker thread between prompts (or between nodes),
+# never while a UniVidX node is executing.
+
+
+def offload_cached_models() -> None:
+    """Move every cached model off the GPU, keeping it loaded in RAM."""
+    from . import advanced as _adv
+    with _CACHE_LOCK:
+        models = list(_MODEL_CACHE.values())
+    for model in models:
+        try:
+            _adv.offload_pipeline(model)
+        except Exception as exc:
+            logger.warning("UniVidX: could not offload cached model (%s)", exc)
+    if models and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def release_cached_models() -> int:
+    """Drop every cached model so its RAM and VRAM can be reclaimed.
+    Returns how many were dropped."""
+    with _CACHE_LOCK:
+        n = len(_MODEL_CACHE)
+        _MODEL_CACHE.clear()
+    if n:
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("UniVidX: released %d cached model(s) — the next run "
+                    "reloads.", n)
+    return n
+
+
+def install_comfy_memory_hooks() -> bool:
+    """Wire the two hooks described above. Idempotent; best-effort, so an
+    unfamiliar ComfyUI just means the buttons don't reach this model."""
+    try:
+        import comfy.model_management as mm
+        import execution
+    except ImportError:
+        return False
+
+    original_unload = mm.unload_all_models
+    if not getattr(original_unload, "_bat_hooked", False):
+        def unload_all_models(*args, **kwargs):
+            result = original_unload(*args, **kwargs)
+            offload_cached_models()
+            return result
+        unload_all_models._bat_hooked = True
+        unload_all_models._bat_original = original_unload
+        mm.unload_all_models = unload_all_models
+
+    executor = getattr(execution, "PromptExecutor", None)
+    original_reset = getattr(executor, "reset", None)
+    if original_reset is not None and not getattr(original_reset, "_bat_hooked", False):
+        def reset(self, *args, **kwargs):
+            release_cached_models()
+            return original_reset(self, *args, **kwargs)
+        reset._bat_hooked = True
+        executor.reset = reset
+    return True
 
 
 def _coerce_attention_backend(value) -> str:
@@ -500,6 +583,12 @@ def sampler_progress(callback):
     denoising step of the pipe() call it wraps, and honour Cancel."""
     from . import advanced as _adv
     return _adv.sampler_progress(callback)
+
+
+def offload_pipeline(model_instance) -> None:
+    """Sampler-facing wrapper around advanced.offload_pipeline."""
+    from . import advanced as _adv
+    _adv.offload_pipeline(model_instance)
 
 
 def context_window_starts(total: int, size: int, stride: int) -> list[int]:
@@ -634,6 +723,13 @@ def load_model(
             # never before — it patches the DiT module's globals, reached
             # through the class (see install_attention_backend).
             adv_mod.install_attention_backend(attention_backend, PipelineCls)
+            # Load into CPU RAM, streaming the DiT shard by shard — no GPU
+            # memory is touched until sampling (see install_cpu_first_loading).
+            if not adv_mod.install_cpu_first_loading(PipelineCls):
+                logger.warning(
+                    "UniVidX: falling back to upstream's loader, which needs "
+                    "~40 GB of VRAM just to load.",
+                )
             model = PipelineCls(**_pipeline_kwargs(variant, wan21_path, ckpt_path))
             _assert_pipeline_fully_wired(model, variant)
 
@@ -656,28 +752,21 @@ def load_model(
                 )
 
             # Hook DiffSynth's VRAM manager so blocks stream CPU<->GPU
-            # during forward. Without this, a 28 GB DiT pins the card
-            # solid and there's nothing left for activations.
+            # during forward. Not optional: the model was loaded into CPU
+            # RAM, and this is what moves layers to the GPU to run.
             pipe = getattr(model, "pipe", None)
-            if pipe is not None and hasattr(pipe, "enable_vram_management"):
-                try:
-                    pipe.enable_vram_management(vram_buffer=float(vram_buffer_gb))
-                    logger.info(
-                        "UniVidX: VRAM management enabled (buffer=%.1f GB "
-                        "reserved for activations; %s)",
-                        float(vram_buffer_gb),
-                        "FP8 DiT" if fp8_quantize != "none" else "bf16 DiT",
-                    )
-                except TypeError as e:
-                    logger.warning(
-                        "UniVidX: enable_vram_management(vram_buffer=...) "
-                        "rejected: %s. Sampling may OOM.", e,
-                    )
-            else:
-                logger.warning(
-                    "UniVidX: model.pipe.enable_vram_management() missing; "
-                    "vram_buffer_gb has no effect on this build.",
+            if pipe is None or not hasattr(pipe, "enable_vram_management"):
+                raise RuntimeError(
+                    "UniVidX: model.pipe.enable_vram_management() missing — "
+                    "upstream's API changed; the wrapper needs updating."
                 )
+            pipe.enable_vram_management(vram_buffer=float(vram_buffer_gb))
+            logger.info(
+                "UniVidX: VRAM management enabled (buffer=%.1f GB "
+                "reserved for activations; %s)",
+                float(vram_buffer_gb),
+                "FP8 DiT" if fp8_quantize != "none" else "bf16 DiT",
+            )
 
             # FP8 runs AFTER enable_vram_management, deliberately: it now
             # converts the wrappers that call installed rather than

@@ -449,12 +449,11 @@ def load_fp8_state_dict_into(model: nn.Module, state_dict: dict) -> dict:
 # ─── FP8 that survives block swapping ───────────────────────────────────────
 
 
-_STREAMABLE_FP8_CLASSES: dict = {}
-
-
 def make_streamable_fp8_class(base: type) -> type:
-    """Build (once per base) `AutoWrappedFP8Linear`, a subclass of the
-    VRAM-management wrapper `base` that stores its weight as scaled fp8.
+    """Build `AutoWrappedFP8Linear`, a subclass of the VRAM-management
+    wrapper `base` that stores its weight as scaled fp8. Built per load
+    rather than cached: `base` comes from a fresh import of upstream each
+    time, and a cache would keep every old import alive.
 
     `base` is upstream's vendored `src.vram_management.AutoWrappedLinear`,
     taken from the pipeline's namespace by the caller. Its contract:
@@ -490,10 +489,6 @@ def make_streamable_fp8_class(base: type) -> type:
       having. It is de-registered as a Parameter so `Module.to(dtype=...)`
       cannot reach it, kept at full precision, and re-attached in forward.
     """
-    cached = _STREAMABLE_FP8_CLASSES.get(base)
-    if cached is not None:
-        return cached
-
     class AutoWrappedFP8Linear(base):  # type: ignore[misc,valid-type]
         """VRAM-managed Linear holding a per-tensor-scaled FP8 weight."""
 
@@ -504,12 +499,21 @@ def make_streamable_fp8_class(base: type) -> type:
             In place, rather than building a replacement, so the
             offload/onload device configuration already computed for this
             layer carries over exactly.
+
+            The arithmetic runs on the layer's compute device when that is
+            a GPU: the model is loaded into CPU RAM, and quantizing 14B
+            parameters there is a memory-bound crawl, while a round trip
+            per layer over PCIe takes a few seconds in total.
             """
-            w_f32 = wrapped.weight.data.to(torch.float32)
+            home = wrapped.weight.device
+            work = torch.device(getattr(wrapped, "computation_device", home))
+            if work.type != "cuda" or not torch.cuda.is_available():
+                work = home
+            w_f32 = wrapped.weight.data.to(device=work, dtype=torch.float32)
             abs_max = w_f32.abs().max().item()
             scale = 1.0 if abs_max < 1e-12 else abs_max / FP8_E4M3_MAX
 
-            wrapped.weight.data = (w_f32 / scale).to(torch.float8_e4m3fn)
+            wrapped.weight.data = (w_f32 / scale).to(torch.float8_e4m3fn).to(home)
             del w_f32
 
             bias = None
@@ -552,7 +556,6 @@ def make_streamable_fp8_class(base: type) -> type:
                 self._fp8_bias = bias  # cache the move; biases are tiny
             return F.linear(x, weight, bias)
 
-    _STREAMABLE_FP8_CLASSES[base] = AutoWrappedFP8Linear
     return AutoWrappedFP8Linear
 
 
