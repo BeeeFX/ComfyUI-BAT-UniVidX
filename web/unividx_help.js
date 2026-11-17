@@ -32,13 +32,24 @@
  * Clicks arrive via `onTitleButtonClick`, which the canvas calls before its
  * own mouse handling (so the click doesn't also drag the node).
  *
+ * The right-click entry uses the node-level `getExtraMenuOptions` hook,
+ * which both renderers honour: the canvas menu calls it directly, and the
+ * Vue-nodes menu (useMoreOptionsMenu) builds its "litegraph" section from
+ * the same `getNodeMenuOptions` call. So there is exactly one entry in
+ * either mode — adding the newer extension-level `getNodeMenuItems` hook
+ * as well would list it twice on the canvas.
+ *
  * The mode reference itself is fetched from /bat_unividx/modes, which the
  * Python side generates from modes.py. It is deliberately NOT duplicated
  * here — an earlier version of this pack hand-mirrored the mode table into
- * JS and the two could drift apart silently.
+ * JS and the two could drift apart silently. It goes through
+ * `api.fetchApi` (i.e. /api/bat_unividx/modes, which ComfyUI registers
+ * for every route) so it also works when ComfyUI is served under a
+ * sub-path behind a reverse proxy; so do the relative imports below.
  */
 
-import { app } from "/scripts/app.js";
+import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 
 // Nodes that get the help affordances. Decode is included because the
 // mode reference explains what its four output slots mean per family;
@@ -63,13 +74,14 @@ let modeCache = null;
 async function fetchModes() {
     if (modeCache) return modeCache;
     try {
-        const resp = await fetch("/bat_unividx/modes");
+        const resp = await api.fetchApi("/bat_unividx/modes");
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data = await resp.json();
         modeCache = data.modes || [];
     } catch (err) {
         console.error("[BAT UniVidX] Could not load mode reference:", err);
-        modeCache = [];
+        // Don't cache the failure — let the next open retry.
+        return [];
     }
     return modeCache;
 }

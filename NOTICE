@@ -14,7 +14,7 @@ paths) are derived from the UniVidX_ComfyUI custom-node pack:
 
   Files: unividx_wrapper_runtime/fp8_loader.py
          unividx_wrapper_runtime/lora_merge.py
-         and the *_advanced() helpers in unividx_wrapper_runtime/runtime.py
+         unividx_wrapper_runtime/advanced.py
 
   Origin: UniVidX_ComfyUI by the original wrapper authors, also GPL v3.
 
@@ -62,18 +62,9 @@ Wan2.1-T2V-14B (Tongyi Wanxiang / Alibaba) — Video diffusion backbone
   Wan2.1-I2V-14B variants are NOT compatible with UniVidX — the
   loader rejects them.
 
-DiffSynth-Engine (modelscope) — VRAM management + Wan VAE plumbing
-  https://github.com/modelscope/DiffSynth-Engine
-  Apache License 2.0
-  Installed via pip; UniVidX depends on it for layer-streaming offload.
-
 UniVidX checkpoint weights (intrinsic + alpha variants)
   https://huggingface.co/houyuanchen/UniVidX
   Downloaded from HuggingFace on first node use. ~0.8 GB per variant.
-
-mmgp (modelscope) — Memory-mapped GPU-friendly safetensors loading
-  Installed transitively via DiffSynth-Engine; used by upstream UniVidX
-  for the FP8 weight-load path.
 
 SageAttention (optional)
   Selected via the loader's attention_backend widget. The wrapper

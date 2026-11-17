@@ -81,14 +81,34 @@ by the loader's `variant` before you pick a mode.
 ## Where output geometry comes from
 
 - **Modes with an IMAGE input** take frame count and resolution from the
-  wired clip — length for frames, frame size for H/W (snapped up to a
-  multiple of 16). These modes have no `num_frames`/`height`/`width`
-  widgets, because those values would only be overridden.
+  wired clip — length for frames, frame size for H/W. These modes have no
+  `num_frames`/`height`/`width` widgets, because those values would only
+  be overridden.
 - **Text-only (`t2…`) modes** have nothing to measure, so they're the
-  only modes that expose those three widgets.
+  only modes that expose those three widgets (H/W snapped to a multiple
+  of 16).
 
-Frame counts are padded up to WAN's `4k+1` requirement internally and
-trimmed back at the output, so you get the same count you fed in.
+The model needs H/W on a multiple of 16 and a `4k+1` frame count. The
+clip is edge-padded up to those — never stretched — and Decode crops and
+trims the padding off again. You get back exactly the resolution and
+frame count you fed in, pixel-aligned with the source.
+
+## Progress, cancelling and re-running
+
+The node's progress bar counts denoising steps, live. **Cancel** stops
+the render at the next step (or next context window), rather than after
+the whole clip.
+
+`seed` defaults to *fixed* after each run rather than *randomize*, so
+re-queueing after a change further down the graph reuses the finished
+render instead of starting a fresh multi-hour one. Switch it to
+randomize if you want a new sample each time.
+
+`denoising_strength` should stay at **1.0**. It is not an img2img
+strength — the wired images always condition the result in full.
+UniVidX generates its outputs from pure noise, so a lower value only
+stops denoising early and leaves visible noise. (It remains on the node
+because saved workflows restore widget values by position.)
 
 ## Text prompts
 
@@ -134,7 +154,9 @@ def decode_help_markdown() -> str:
     """Help page for the Decode node."""
     return """# 🦇 UniVidX Decode
 
-Splays the opaque result from 🦇 UniVidX Sample into four IMAGE outputs.
+Splays the opaque result from 🦇 UniVidX Sample into four IMAGE outputs,
+plus the matte as a MASK. Every output has exactly the resolution and
+frame count of the clip wired into the Sample node.
 
 ## Output slots
 
@@ -146,12 +168,17 @@ Slot names cover both families, because one node serves both:
 | `albedo / pha` | albedo (base colour) | matte |
 | `irradiance / fgr` | irradiance (lighting) | foreground |
 | `normal / bgr` | surface normals | background |
+| `matte (mask)` | — (empty) | matte, as a MASK |
+
+The MASK slot saves an image-to-mask conversion before compositing. It is
+empty for intrinsic modes and for alpha modes that take the matte as an
+input.
 
 A slot the chosen mode didn't produce comes back as **black frames**, and
 the console names which ones. So `R2AIN` — which takes RGB rather than
 producing it — returns black on the `rgb` slot.
 
-## Why there are always exactly four outputs
+## Why the outputs are fixed
 
 The output count can't adapt to the connected Sample node's mode.
 ComfyUI has no dynamic-output mechanism: the dynamic-input types
@@ -160,7 +187,7 @@ the V3 API is an unimplemented stub, and a node's outputs are cached
 class-wide the first time its schema resolves — so they can't vary per
 node instance.
 
-Keeping all four slots present (rather than faking it) also means your
+Keeping every slot present (rather than faking it) also means your
 downstream wiring survives switching modes.
 """
 
@@ -192,10 +219,10 @@ produce nonsense.
 
 ### `dtype` — leave on `bf16`
 
-Compute precision for the pipeline. `bf16` is what UniVidX was trained and
-released in. `fp16` exists for hardware without bf16 support and is not
-recommended here: this model's value range was never checked against
-fp16's smaller exponent, so overflow is a real risk.
+UniVidX's pipeline is hardcoded to bf16 upstream, so this widget cannot
+change the compute precision: `fp16` is accepted, logged as ignored, and
+does not trigger a reload. It stays on the node only because saved
+workflows restore widget values by position.
 
 Note this is separate from `fp8_quantize`, which changes how weights are
 *stored*, not how maths is done.
@@ -272,6 +299,27 @@ Quantised layers now keep their offload machinery and stay fp8 in *every*
 state — so the GPU-resident copy is 1 byte per parameter too, not just the
 offloaded one. Numerics are unchanged from the old FP8 path (measured
 identical), and biases and LoRA adapters stay bf16.
+
+### Where the model lives, and the memory buttons
+
+Loading uses **no VRAM**. The model loads straight into system RAM, with
+the DiT built empty and filled one checkpoint shard at a time, and layers
+move to the GPU only when sampling starts, within the budget above.
+(Upstream's own loader put the ~28 GB DiT and ~11 GB text encoder on the
+GPU first, so a 24-32 GB card failed before sampling could even begin.)
+Rough system-RAM needs (estimates): ~45 GB free while loading, ~26 GB
+while loaded with FP8, ~40 GB without.
+
+After every run the Sample node moves its results to the CPU and offloads
+the model to RAM, so the GPU is free for the rest of the graph.
+
+ComfyUI's own buttons reach the model:
+
+- **Unload models** — moves it off the GPU, keeps it in RAM. The next run
+  resumes in seconds. (ComfyUI also does this by itself after an
+  out-of-memory error.)
+- **Free model and node cache** — releases it from RAM entirely. The next
+  run reloads it.
 
 ## What's on by default
 
@@ -359,41 +407,39 @@ skip more eagerly than it would elsewhere.
 Requires `cfg_scale=1.0`. Above that the DiT runs twice per step and one
 cache would mix the two passes, so it refuses rather than corrupt.
 
-### 3. `compile_dit` — worth trying, size unverified
+### 3. `compile_dit` — worth trying, payoff unmeasured
 
-`torch.compile` on the DiT, already implemented — just off by default.
+`torch.compile` on each of the DiT's 40 transformer blocks, in place.
 
-The three things that could have made it useless here were checked and all
-came back clean. Dynamo traces **zero graph breaks** through FP8Linear,
-through peft called with per-row `adapter_names` (UniVidX's four-adapter
-dispatch), and through a plain Linear baseline; a compiled module also
-survived a CPU↔GPU offload/onload cycle, which is what VRAM management
-does every step. Changing sequence lengths — which context windowing
-produces, since the last window can be shorter — were handled without a
-recompile storm.
+Per block because that is what actually runs: upstream's sampling loop
+reaches into the DiT for its blocks directly and never calls the DiT's own
+`forward`. (An earlier version compiled the DiT as a whole — which
+compiled nothing that ever executed, so the option did nothing.)
 
-So it should work. What is **not** verified is the payoff: the "20-30%"
-figure is inherited, not measured on this model. Turn it on, compare
-wall-clock, keep it if it earns its place.
+Default inductor mode with dynamic shapes, not `reduce-overhead`: that
+mode means CUDA Graphs, which pin tensor addresses, and block swapping
+moves weights between CPU and GPU every run.
 
-Two practical notes. The first sampler step pays the compile cost — tens
-of seconds at minimum, likely a couple of minutes for a 40-block 14B DiT —
-so it only makes sense on long runs, and it is wasted on a 4-step distilled
-render. And `mode="reduce-overhead"` normally means CUDA Graphs, but it is
-paired with `dynamic=True`, which generally prevents graph capture; the
-practical effect is probably inductor codegen without the CUDA-graph win.
-If you want to experiment, a fixed-shape batch with `dynamic=False` is the
-variant most likely to beat it.
+What is **not** verified is the payoff on this model. Turn it on, compare
+wall-clock, keep it if it earns its place. The first sampler step pays the
+compile cost — minutes for a 14B DiT — so it only makes sense on long
+runs, and it is wasted on a 4-step distilled render.
 
 ### 4. `attention_backend` — a few percent at most
 
-Do not expect much. UniVidX hardcodes SDPA, but torch's SDPA is *already*
-a fused FlashAttention kernel; forcing the naive math path on the same
+Do not expect much from the kernel choice. UniVidX hardcodes SDPA, but
+torch's SDPA is *already* a fused FlashAttention kernel; forcing the naive math path on the same
 shape is 13x slower, which is what an actual missing optimisation would
 look like. Measured at Wan2.1-14B geometry on sm_86: SDPA 14.4 ms, FA2
 13.9 ms, SageAttention 16.7 ms. Sage was both slower and less exact there,
 so it is excluded from `auto` — but it is worth re-measuring on a
 different card.
+
+Whichever backend you pick, the wrapper's attention also folds the four
+modality streams' keys/values with a view instead of upstream's copy —
+measured at ~58% less attention scratch memory and 1.8x faster for that
+step, bit-identical output. (Until this release the dispatcher was never
+actually installed, so neither the backend choice nor this saving applied.)
 
 ## What is not worth trying
 
@@ -572,14 +618,16 @@ loader matters so much for long clips.
 More overlap means smoother joins and more windows. Less overlap is faster
 and riskier.
 
-## Two known limitations
+## Windows are always full length
 
-**The last window can be short.** Upstream's tiler lets the final window
-run to whatever is left rather than shifting it back to full length, so a
-clip whose length is not a neat multiple may end on a window with much
-less context. If the last second of a render looks weaker than the rest,
-that is why — adjusting `context_frames` so the clip divides more evenly
-is the workaround.
+When the stride doesn't land the last window exactly on the end of the
+clip, the last window is shifted back to finish flush with it, overlapping
+its neighbour by more than usual. (Upstream's tiler let it run short —
+sometimes only a few frames of context — which made the end of long
+renders visibly weaker.) Overlaps are crossfaded linearly and accumulated
+in float32.
+
+## One known limitation
 
 **Position encoding restarts per window.** Each window's temporal
 positions begin at zero rather than continuing the global timeline. This
